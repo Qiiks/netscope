@@ -88,6 +88,68 @@ pub fn wine_pid_matches(profile: &Profile, pid: u32) -> bool {
     args.iter().any(|arg| wine_arg_matches(path, arg))
 }
 
+/// Name targets currently running with a matching process name or argv basename.
+///
+/// This is the target kind for a running app whose install path the operator
+/// does not want to store: a native process matches its `comm` or argv[0]
+/// basename, and a Wine/Proton game matches the PE basename in its argv.
+pub fn scan_name(profiles: &[Profile]) -> Vec<(String, u32)> {
+    let mut found = Vec::new();
+    for pid in pids() {
+        if pid == 1 || pid == std::process::id() {
+            continue;
+        }
+        let Some(uid) = crate::cgroup::read_uid(pid) else {
+            continue;
+        };
+        for profile in profiles {
+            if name_pid_matches(profile, uid, pid) {
+                found.push((profile.id.clone(), pid));
+            }
+        }
+    }
+    found
+}
+
+/// True when `pid` is a process the name target selects.
+pub fn name_pid_matches(profile: &Profile, uid: u32, pid: u32) -> bool {
+    let Target::Name { name } = &profile.target else {
+        return false;
+    };
+    profile.target_uid == uid && process_name_matches(name, pid)
+}
+
+fn process_name_matches(name: &str, pid: u32) -> bool {
+    let needle = norm_name(name);
+    if needle.is_empty() {
+        return false;
+    }
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|text| norm_name(text.trim()))
+        .unwrap_or_default();
+    if comm == needle {
+        return true;
+    }
+    cmdline(pid)
+        .unwrap_or_default()
+        .iter()
+        .any(|arg| arg_name_matches(&needle, arg))
+}
+
+/// Compare one argv token by basename, accepting the `C:\...` and `Z:\...`
+/// shapes Wine uses. A name target carries no directory at all.
+fn arg_name_matches(needle: &str, arg: &str) -> bool {
+    let token = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+    norm_name(token) == needle
+}
+
+/// A name compares case-folded with a trailing `.exe` dropped. `Overwatch`,
+/// `Overwatch.exe`, and `overwatch.exe` are the same target.
+fn norm_name(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
 /// True when `pid` runs one of the Wine loader/server executables.
 pub fn is_wine_process(pid: u32) -> bool {
     let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) else {
@@ -246,6 +308,23 @@ mod tests {
     #[test]
     fn current_process_is_not_wine() {
         assert!(!is_wine_process(std::process::id()));
+    }
+
+    #[test]
+    fn name_args_match_native_and_wine_basenames() {
+        assert!(arg_name_matches("overwatch", "C:\\Games\\Overwatch.exe"));
+        assert!(arg_name_matches("overwatch", "Z:\\Games\\Overwatch.exe"));
+        assert!(arg_name_matches("overwatch", "/usr/bin/overwatch"));
+        assert!(arg_name_matches("overwatch", "Overwatch.exe"));
+        assert!(!arg_name_matches("overwatch", "/usr/bin/overwatch-helper"));
+        assert!(!arg_name_matches("overwatch", ""));
+    }
+
+    #[test]
+    fn name_normalization_drops_exe_and_case() {
+        assert_eq!(norm_name(" Overwatch.EXE "), "overwatch");
+        assert_eq!(norm_name("Overwatch"), "overwatch");
+        assert_eq!(norm_name(".exe"), "");
     }
 
     #[test]

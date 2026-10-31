@@ -84,7 +84,7 @@ The filter applies to packets, not to an application's lifetime. A connection th
 
 ## Changes and removal
 
-- Editing a profile is not supported in v0.1.0. Remove it and add it again with the new mode or exceptions.
+- Editing a profile is not supported in v0.2.0. Remove it and add it again with the new mode or exceptions.
 - `enable` and `disable` keep the profile and its cgroup but stop or resume enforcement.
 - `remove` deletes the nftables table and the cgroup. Traffic is unfiltered immediately.
 

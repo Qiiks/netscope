@@ -63,7 +63,7 @@ body:
     id: constraints
     attributes:
       label: Scope checks
-      description: The following are fixed constraints for v0.1.x.
+      description: The following are fixed constraints for v0.2.x.
       options:
         - label: This does not require a wrapper, `LD_PRELOAD`, or proxy auto-configuration.
         - label: This does not require a kernel module or an eBPF program.

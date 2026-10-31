@@ -18,7 +18,17 @@ This is a scope decision, not a claim that eBPF is unsuitable for every workload
 
 ## Is there a wrapper?
 
-No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. A native app is selected at `exec` through fanotify; a Windows PE is selected when Wine opens it; otherwise the poller catches it late.
+No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. A native app is selected at `exec` through fanotify; a Windows PE is selected when Wine opens it; a name target is caught by the poller; otherwise the poller catches it late.
+
+## Can I select a running app by name without a path?
+
+Yes. `--process <name>` attaches a running process by its `comm` or an argv basename, with no install path and no wrapper:
+
+```sh
+sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
+```
+
+Matching is case-insensitive and a trailing `.exe` is optional. This is a late attach: the process is moved into the profile cgroup on the next poll, and sockets opened before the move keep their original route. Use `--exe` or `--wine` when you need the first socket covered.
 
 ## What about applications that are already running?
 
@@ -52,11 +62,11 @@ An application that starts before the daemon is attached late, and its early soc
 
 ## Can I edit a profile?
 
-Not in v0.1.0. Remove it and add it again with the new target or mode. `enable` and `disable` toggle enforcement without changing the definition.
+Not in v0.2.0. Remove it and add it again with the new target or mode. `enable` and `disable` toggle enforcement without changing the definition.
 
 ## Can one profile cover several applications?
 
-No. One profile has one target: a native executable, a Windows PE run through Wine/Proton, or a Steam app ID. Use separate profiles, up to 32.
+No. One profile has one target: a native executable, a running process name, a Windows PE run through Wine/Proton, or a Steam app ID. Use separate profiles, up to 32.
 
 ## Can two profiles target the same application?
 
@@ -86,7 +96,7 @@ Only a Wine process running the selected PE is attached. Another program that op
 
 If fanotify cannot be used, the fallback matches Wine processes by command line, including `Z:\...` paths and the `C:\...`/`/drive_c/` form, and attaches late. Sockets opened during startup can then escape, so restart the game after the profile attaches.
 
-For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
+For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. If you do not want to store a path, `--process Overwatch.exe` attaches the running game by name, at the cost of late attachment. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
 
 ## Is it a firewall?
 
@@ -98,7 +108,7 @@ No. It relies on Linux cgroup v2, fanotify, nftables, and policy routing.
 
 ## Does it work with Flatpak or Snap applications?
 
-Not tested in v0.1.0. Sandboxed applications may run in a different cgroup or mount namespace, and the executable path you see outside the sandbox may not be the path the daemon matches. Use `netscope status` to see whether the process was attached, and report a reproducible case.
+Not tested in v0.2.0. Sandboxed applications may run in a different cgroup or mount namespace, and the executable path you see outside the sandbox may not be the path the daemon matches. Use `netscope status` to see whether the process was attached, and report a reproducible case.
 
 ## What license is it under?
 
@@ -106,4 +116,4 @@ Dual-licensed under MIT OR Apache-2.0, at your option. Contributions are accepte
 
 ## Why is there no GUI or remote dashboard?
 
-The v0.1.x scope is a CLI and a local root daemon. There is no network listener, no telemetry, and no hosted service. A remote UI would widen the privileged surface and is out of scope for now.
+The v0.2.x scope is a CLI and a local root daemon. There is no network listener, no telemetry, and no hosted service. A remote UI would widen the privileged surface and is out of scope for now.

@@ -23,7 +23,7 @@ A regular user in the `netscope` group does not pass `--uid`; their profile belo
 |---|---|---|
 | `0` | Success. | — |
 | `1` | Runtime or daemon error, including invalid daemon JSON, API version mismatch, nftables/routing/cgroup failure, an unknown profile, a duplicate profile, the profile limit, a daemon policy rejection that is not a permission error, or a failed `doctor` check. | `netscope: <error>` |
-| `2` | Usage or validation error caught by the client: bad flag combination, invalid profile ID, invalid CIDR, invalid gateway, unresolvable `--exe` or `--wine`, invalid Steam app ID, `--no-redact` without `--acknowledge`, or a non-root `--uid`. | `netscope: <error>` |
+| `2` | Usage or validation error caught by the client: bad flag combination, invalid profile ID, invalid CIDR, invalid gateway, unresolvable `--exe` or `--wine`, a `--process` value that is empty or contains a path separator, invalid Steam app ID, `--no-redact` without `--acknowledge`, or a non-root `--uid`. | `netscope: <error>` |
 | `3` | Daemon unavailable, or `cleanup` attempted while the daemon is still running. | `netscope: daemon not running; start with: sudo systemctl start netscoped` |
 | `4` | Permission denied, a profile owned by another user, a `target_uid` that does not match the caller, or `support-bundle` invoked without root. | `netscope: permission denied; add your user to the netscope group: sudo usermod -aG netscope $USER` |
 
@@ -40,17 +40,18 @@ netscope status [--json]
 Prints the daemon version, pid, kernel, cgroup root, and one row per profile. The text form has a daemon header and the same columns as `list`:
 
 ```text
-DAEMON  netscoped 0.1.0  pid 1234  kernel 6.11.0-arch1-1
+DAEMON  netscoped 0.2.0  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
 NAME     MODE    ENABLED  TARGET                      ATTACHED  PIDS
 blocked  filter  yes      /usr/bin/curl               pre-exec  4242
 game     route   yes      wine:/games/Game/Game.exe   pre-open  5150
+running  route   yes      name:Overwatch.exe          late      6120
 routed   route   yes      /usr/bin/firefox            late      5150,5151
 ```
 
 The state path and config path are available in `--json` output.
 
-`ATTACHED` is `pre-exec` when only the native exec hook placed processes, `pre-open` when only the Wine open hook did, and `late` when only the poll fallback did. It is `mixed` when a pre-attach source (`pre-exec` or `pre-open`) and the poll fallback are both present, and `none` when no process is attached. A Wine profile shows its target as `wine:<path>`. `PIDS` is a comma-separated list.
+`ATTACHED` is `pre-exec` when only the native exec hook placed processes, `pre-open` when only the Wine open hook did, and `late` when only the poll fallback did. It is `mixed` when a pre-attach source (`pre-exec` or `pre-open`) and the poll fallback are both present, and `none` when no process is attached. A Wine profile shows its target as `wine:<path>`; a process-name profile shows `name:<name>`. `PIDS` is a comma-separated list.
 
 `status` exits `3` when the daemon is not reachable.
 
@@ -67,15 +68,17 @@ Prints the profile table without the daemon header. Disabled profiles are includ
 ```text
 netscope add <name> --exe <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
 netscope add <name> --wine <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
+netscope add <name> --process <name> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
 netscope add <name> --steam <appid> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
 ```
 
-Creates a profile. Exactly one of `--exe`, `--wine`, and `--steam` is required, and exactly one of `--filter` and `--route` is required.
+Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` is required, and exactly one of `--filter` and `--route` is required.
 
 | Option | Applies to | Meaning |
 |---|---|---|
 | `--exe <path>` | Native apps | Executable to select. Resolved against the CLI's current directory, then canonicalized. |
 | `--wine <path>` | Wine/Proton apps | Windows PE to select. Must be an absolute path. The daemon canonicalizes it and requires an `MZ` header. |
+| `--process <name>` | Running apps | Process name or argv basename. No install path. Matches `comm` and command-line basenames case-insensitively; a trailing `.exe` is optional. |
 | `--steam <appid>` | Steam apps | Numeric Steam app ID. Matches the app and its children. |
 | `--filter <drop\|allow>` | Filter profiles | Default action. |
 | `--allow-cidr <cidr>` | `--filter drop` | Destination to keep reachable. Repeatable. |
@@ -89,8 +92,9 @@ Creates a profile. Exactly one of `--exe`, `--wine`, and `--steam` is required, 
 Rules enforced before the daemon is asked:
 
 - Name: `^[a-z0-9][a-z0-9-]{0,31}$`.
-- Exactly one target: `--exe`, `--wine`, or `--steam`. Combining them is a usage error.
+- Exactly one target: `--exe`, `--wine`, `--process`, or `--steam`. Combining them is a usage error.
 - `--wine` takes an absolute path to a regular file that starts with `MZ`. The daemon canonicalizes the path and stores its device and inode.
+- `--process` takes a name, not a path. It is matched against the process `comm` and argv basenames; `Overwatch`, `Overwatch.exe`, and `overwatch.exe` are the same target. It attaches on the poll, so sockets opened before the attach keep their original route.
 - `--allow-cidr` is rejected with `--filter allow`.
 - `--deny-cidr` is rejected with `--filter drop`, and `--filter allow` needs at least one.
 - `--gateway` is rejected outside `--route`.
@@ -108,12 +112,13 @@ sudo netscope --uid "$(id -u)" add blocked --exe /usr/bin/curl --filter drop
 sudo netscope --uid "$(id -u)" add routed --exe /usr/bin/game --route tun0 --include-lan
 sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter drop
 sudo netscope --uid "$(id -u)" add game-route --wine /games/Game/Game.exe --route tun0
+sudo netscope --uid "$(id -u)" add running-game --process Overwatch.exe --route tun0
 sudo netscope add steam-game --steam 730 --filter drop --allow-cidr 203.0.113.0/24
 ```
 
 The last example assumes the user is in the `netscope` group and has re-logged in. On success, `add` prints `added <name>`; with a late attach it prints the restart warning on the next line.
 
-For a Wine target the profile attaches when a Wine process opens the PE, which is before the game runs. Launch the game the same way you would without netscope — there is no wrapper. See [Wine and Proton targets](how-it-works.md#wine-and-proton-targets).
+For a Wine target the profile attaches when a Wine process opens the PE, which is before the game runs. Launch the game the same way you would without netscope — there is no wrapper. A `--process` target is for a process that is already running or that starts within the poll interval; it does not need the path and is reported as `late`. See [Wine and Proton targets](how-it-works.md#wine-and-proton-targets) and [Name targets](how-it-works.md#name-targets).
 
 ## `remove`
 
@@ -138,7 +143,7 @@ netscope disable <name>
 netscope refresh
 ```
 
-Forces an immediate target re-stat and attach pass instead of waiting for `refresh_interval_secs`. It re-resolves each `--exe` or `--wine` target's device and inode and attaches already-running matching processes, then prints `refreshed`. For a Wine target whose file changed, it moves the fanotify mark to the new inode. It does not repair a deleted nftables table; the daemon's health loop does that.
+Forces an immediate target re-stat and attach pass instead of waiting for `refresh_interval_secs`. It re-resolves each `--exe` or `--wine` target's device and inode, attaches already-running matching processes (including name targets), then prints `refreshed`. For a Wine target whose file changed, it moves the fanotify mark to the new inode. It does not repair a deleted nftables table; the daemon's health loop does that.
 
 ## `doctor`
 

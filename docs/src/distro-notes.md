@@ -1,6 +1,6 @@
 # Distro notes
 
-netscope needs a modern kernel, unified cgroup v2, nftables, iproute2, and systemd. These notes describe what usually works. The project's CI runs on Ubuntu 24.04; the AUR package and the release tarball are the only packaged channels in v0.1.0, and the release binary is x86_64.
+netscope needs a modern kernel, unified cgroup v2, nftables, iproute2, and systemd. These notes describe what usually works. The project's CI runs on Ubuntu 24.04; the AUR package and the release tarball are the only packaged channels in v0.2.0, and the release binary is x86_64.
 
 ## Kernel configuration
 
@@ -31,7 +31,7 @@ sudo usermod -aG netscope "$USER"
 
 ## Fedora
 
-Fedora has cgroup v2 by default, a recent kernel, nftables, and systemd. There is no official package in v0.1.0; install the [release tarball](install.md#release-tarball).
+Fedora has cgroup v2 by default, a recent kernel, nftables, and systemd. There is no official package in v0.2.0; install the [release tarball](install.md#release-tarball).
 
 With SELinux enforcing, a denial can block fanotify permission events or writes under `/sys/fs/cgroup`. Check the audit log before changing policy:
 
@@ -49,7 +49,7 @@ Report a denial that reproduces with the shipped unit. Do not disable SELinux gl
 - **Debian 11:** kernel 5.10 is too old for pre-exec attachment. Upgrade the kernel or use a newer release.
 - **Ubuntu 20.04:** kernel 5.4 is too old. Upgrade.
 
-Use the tarball; there is no Debian package in v0.1.0.
+Use the tarball; there is no Debian package in v0.2.0.
 
 ## openSUSE Tumbleweed
 
@@ -61,7 +61,7 @@ RHEL 9 and compatible rebuilds ship kernel 5.14 or newer with cgroup v2 and nfta
 
 ## NixOS
 
-There is no NixOS module or package in v0.1.0. The tarball can be installed manually, but the unit and sysusers file are not declarative. A proper module would need to express the group, unit, config, and state directory; it is not included yet.
+There is no NixOS module or package in v0.2.0. The tarball can be installed manually, but the unit and sysusers file are not declarative. A proper module would need to express the group, unit, config, and state directory; it is not included yet.
 
 ## Alpine and other non-systemd distributions
 
@@ -74,7 +74,7 @@ Unsupported. netscope's service management, socket directory, and state director
 
 ## 32-bit and ARM
 
-The v0.1.0 release tarball is x86_64 only, and `install.sh` rejects other architectures. The workspace can be built from source on other architectures, but the installer will not run there; copy the binaries, unit, sysusers entry, and config into place manually. The kernel features, not the CPU, determine whether the result works.
+The v0.2.0 release tarball is x86_64 only, and `install.sh` rejects other architectures. The workspace can be built from source on other architectures, but the installer will not run there; copy the binaries, unit, sysusers entry, and config into place manually. The kernel features, not the CPU, determine whether the result works.
 
 ## Firewall coexistence
 

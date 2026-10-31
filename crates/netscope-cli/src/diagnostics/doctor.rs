@@ -441,6 +441,11 @@ fn validate_state(state: &State, max_profiles: u8) -> Vec<String> {
                 problems.push(format!("profile '{id}' has Steam app id 0"));
             }
             Target::Steam { .. } => {}
+            Target::Name { name } => {
+                if name.trim().is_empty() || name.contains('/') || name.contains('\\') {
+                    problems.push(format!("profile '{id}' has an invalid process name"));
+                }
+            }
         }
         match &profile.mode {
             Mode::Filter { exceptions, .. } => {

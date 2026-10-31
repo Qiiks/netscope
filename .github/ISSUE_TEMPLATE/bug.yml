@@ -55,7 +55,7 @@ body:
     attributes:
       label: netscope version
       description: Output of `netscope --version`.
-      placeholder: netscope 0.1.0
+      placeholder: netscope 0.2.0
     validations:
       required: true
 

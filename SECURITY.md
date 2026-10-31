@@ -12,7 +12,7 @@ sudo netscope support-bundle
 
 ## Trust boundary
 
-`netscoped` runs as root. It creates cgroups, calls `nft` and `ip`, and reads `/proc`. It accepts JSON-lines requests only on a Unix socket owned by `root:netscope` with mode `0660`; it does not open a TCP listener or a web UI in v0.1.0.
+`netscoped` runs as root. It creates cgroups, calls `nft` and `ip`, and reads `/proc`. It accepts JSON-lines requests only on a Unix socket owned by `root:netscope` with mode `0660`; it does not open a TCP listener or a web UI in v0.2.0.
 
 Members of the `netscope` group may add profiles for their own UID and may manage profiles they own. Only root may manage another user's profile. The daemon validates profile names, paths, CIDRs, interfaces, and numeric ranges, and never invokes a shell.
 

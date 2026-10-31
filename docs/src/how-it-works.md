@@ -4,8 +4,8 @@ netscope gives one application a cgroup identity and writes nftables rules that 
 
 ## The pipeline
 
-1. **Add a profile.** The CLI canonicalizes `--exe` and sends its path to the daemon. The daemon resolves the path to a device and inode and stores that identity with the profile. A `--wine` profile does the same for a Windows PE, after checking that the file starts with `MZ`. A Steam profile stores the app ID instead.
-2. **Catch the next exec or open.** `fanotify` watches for `exec` of the selected native inode, or for the first open of the selected PE by a Wine/Proton loader. The kernel holds the operation until the daemon answers, which gives the daemon time to create `/sys/fs/cgroup/netscope/<profile>` and move the new process into it.
+1. **Add a profile.** The CLI canonicalizes `--exe` and sends its path to the daemon. The daemon resolves the path to a device and inode and stores that identity with the profile. A `--wine` profile does the same for a Windows PE, after checking that the file starts with `MZ`. A `--process` profile stores only the process name. A Steam profile stores the app ID instead.
+2. **Catch the next exec or open.** `fanotify` watches for `exec` of the selected native inode, or for the first open of the selected PE by a Wine/Proton loader. The kernel holds the operation until the daemon answers, which gives the daemon time to create `/sys/fs/cgroup/netscope/<profile>` and move the new process into it. Name targets have no inode to mark, so the poll attaches them by scanning `/proc`.
 3. **Match on the cgroup.** nftables rules use `socket cgroupv2`, not a process name, PID, or executable string. A process cannot escape the match by renaming itself or by being re-parented.
 4. **Filter or mark.** A filter profile accepts or drops matching packets. A route profile sets a firewall mark on them.
 5. **Route by mark.** For route profiles, an `ip rule` sends marked packets to a dedicated routing table containing the tunnel route and a higher-metric blackhole default.
@@ -52,9 +52,31 @@ The mark is on the file rather than on an exec, so it also catches a load by a l
 
 Wine itself is not installed by netscope and is not required to configure a profile. Adding the profile fails if the path is not absolute, cannot be canonicalized, is not a regular file, or does not start with `MZ`.
 
+## Name targets
+
+A `--process <name>` target is for a running app whose install path you do not
+want to store. It is the only target kind that needs no file identity:
+
+- The daemon scans `/proc` on the poll interval and reads each process's
+  `comm` and command line.
+- A process matches when its `comm` equals the name, or when any argv token's
+  basename equals it. Matching is case-insensitive and drops a trailing
+  `.exe`, so `Overwatch`, `Overwatch.exe`, and `overwatch.exe` select the same
+  process; `C:\Games\Overwatch.exe` matches as an argv token, but a path is not
+  an accepted target value.
+- The matching process and its descendants are moved into the profile cgroup.
+  `status` reports the target as `name:<name>` and the attach source as `late`.
+- A process already running is attached on the next poll. A process started
+  later is attached within one poll interval.
+
+The gap is the same as every late attachment: a socket opened before the move
+keeps its original cgroup, so it is not matched by the profile. Use `--exe` or
+`--wine` when you need the socket covered from its first packet. Name targets
+also cannot distinguish two processes with the same name; both are attached.
+
 ## Late attachment (poll fallback)
 
-If fanotify cannot be used — for example because the kernel or a security policy refuses the permission group — the daemon scans `/proc` on an interval (`poll_interval_ms`, default 1000 ms). It attaches matching processes and their children after the fact. For a native target it matches the executable path. For a Wine target it requires a Wine process and matches the configured PE path against the process command line, accepting a Windows-style `Z:\...` path and the `C:\...` form that maps under `/drive_c/`.
+If fanotify cannot be used — for example because the kernel or a security policy refuses the permission group — the daemon scans `/proc` on an interval (`poll_interval_ms`, default 1000 ms). It attaches matching processes and their children after the fact. For a native target it matches the executable path. For a Wine target it requires a Wine process and matches the configured PE path against the process command line, accepting a Windows-style `Z:\...` path and the `C:\...` form that maps under `/drive_c/`. Name targets always use this path.
 
 Late attachment has an unavoidable gap: a socket opened before the process was moved keeps its original cgroup, so it is not matched by the profile's rules. This also applies to Wine targets, where the loader may open sockets while starting the game. The daemon reports the profile as `late` and the CLI prints a warning when it attaches to an already-running app:
 

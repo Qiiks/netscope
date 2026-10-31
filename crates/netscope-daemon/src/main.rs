@@ -776,6 +776,7 @@ fn attach_matches(rt: &Rt, inner: &mut Inner) {
     let mut matches = proc::scan_native(&profiles);
     matches.extend(proc::scan_steam(&profiles));
     matches.extend(proc::scan_wine(&profiles));
+    matches.extend(proc::scan_name(&profiles));
     for (id, pid) in matches {
         attach_one(rt, inner, &id, pid, AttachSource::Late);
     }
@@ -820,7 +821,7 @@ fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
             Target::Native { path, dev, ino } | Target::Wine { path, dev, ino } => {
                 (path.clone(), *dev, *ino)
             }
-            Target::Steam { .. } => continue,
+            Target::Steam { .. } | Target::Name { .. } => continue,
         };
         let enabled = profile.enabled;
         let metadata = match fs::metadata(&path) {
@@ -1039,7 +1040,7 @@ async fn handle_exec(rt: &Rt, event: ExecEvent) {
                     ino: event_ino,
                     ..
                 } => mask & libc::FAN_OPEN_PERM != 0 && *event_dev == dev && *event_ino == ino,
-                Target::Steam { .. } => false,
+                Target::Steam { .. } | Target::Name { .. } => false,
             }
         })
         .cloned();
@@ -1375,6 +1376,11 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
             warnings.push("executable missing".to_string());
         }
     }
+    if matches!(&profile.target, Target::Name { .. }) {
+        warnings.push(
+            "name target attaches late; sockets opened before attach are unaffected".to_string(),
+        );
+    }
     ProfileStatus {
         id: profile.id.clone(),
         mode: match &profile.mode {
@@ -1385,6 +1391,7 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         target: match &profile.target {
             Target::Native { path, .. } => path.clone(),
             Target::Wine { path, .. } => format!("wine:{path}"),
+            Target::Name { name } => format!("name:{name}"),
             Target::Steam { app_id } => format!("steam:{app_id}"),
         },
         cgroup: rt.cgroup.root().join(&profile.id).display().to_string(),
@@ -1508,7 +1515,7 @@ fn add_target_mark(rt: &Rt, profile: &Profile) -> Result<(), FanotifyError> {
     match &profile.target {
         Target::Native { path, .. } => fanotify.add_exec_mark(Path::new(path)),
         Target::Wine { path, .. } => fanotify.add_open_mark(Path::new(path)),
-        Target::Steam { .. } => Ok(()),
+        Target::Steam { .. } | Target::Name { .. } => Ok(()),
     }
 }
 
@@ -1519,7 +1526,7 @@ fn remove_target_mark(rt: &Rt, profile: &Profile) {
     let result = match &profile.target {
         Target::Native { path, .. } => fanotify.remove_exec_mark(Path::new(path)),
         Target::Wine { path, .. } => fanotify.remove_open_mark(Path::new(path)),
-        Target::Steam { .. } => Ok(()),
+        Target::Steam { .. } | Target::Name { .. } => Ok(()),
     };
     if let Err(err) = result {
         debug!("fanotify unmark profile={} error={err:?}", profile.id);
@@ -1767,6 +1774,30 @@ fn parse_cidr(text: &str) -> Result<(), String> {
 
 fn resolve_target(spec: &TargetSpec) -> Result<Target, String> {
     match spec {
+        TargetSpec::Name { name } => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("process name must not be empty".to_string());
+            }
+            if name.contains('/') || name.contains('\\') {
+                return Err(
+                    "process name must be a name, not a path; use --wine for a PE path".to_string(),
+                );
+            }
+            if name.len() > 64 || name.chars().any(|ch| ch.is_control()) {
+                return Err("process name must be at most 64 printable characters".to_string());
+            }
+            let folded = name.to_lowercase();
+            let banned = ["netscope", "netscoped", "wineserver"];
+            if banned.contains(&folded.as_str()) {
+                return Err(format!(
+                    "refusing to scope daemon or shared Wine process {name}"
+                ));
+            }
+            Ok(Target::Name {
+                name: name.to_string(),
+            })
+        }
         TargetSpec::Steam { app_id } => {
             if *app_id == 0 {
                 return Err("steam app id must be non-zero".to_string());
@@ -1872,6 +1903,11 @@ fn duplicate_target(profiles: &BTreeMap<ProfileId, Profile>, target: &Target) ->
             }
             (Target::Steam { app_id }, Target::Steam { app_id: existing })
                 if app_id == existing =>
+            {
+                return Some(profile.id.clone());
+            }
+            (Target::Name { name }, Target::Name { name: existing })
+                if name.eq_ignore_ascii_case(existing) =>
             {
                 return Some(profile.id.clone());
             }

@@ -41,7 +41,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Scope a native executable, Wine/Proton PE, or Steam app
+    /// Scope a native executable, process name, Wine/Proton PE, or Steam app
     Add(AddArgs),
     /// Remove a profile and its rules
     Remove { name: String },
@@ -93,7 +93,7 @@ enum Cmd {
     ArgGroup::new("target")
         .required(true)
         .multiple(false)
-        .args(["exe", "wine", "steam"]),
+        .args(["exe", "wine", "process", "steam"]),
 ))]
 struct AddArgs {
     name: String,
@@ -101,6 +101,8 @@ struct AddArgs {
     exe: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     wine: Option<PathBuf>,
+    #[arg(long, value_name = "NAME")]
+    process: Option<String>,
     #[arg(long, value_name = "APPID")]
     steam: Option<u32>,
     #[arg(
@@ -201,6 +203,7 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
         name: args.name,
         exe: args.exe,
         wine: args.wine,
+        process: args.process,
         steam: args.steam,
         filter: args.filter,
         route: args.route,

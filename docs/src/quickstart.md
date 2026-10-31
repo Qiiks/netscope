@@ -104,7 +104,17 @@ The path must be absolute, and the file must start with `MZ` — the DOS/PE head
 
 For a Steam Proton game, select the `.exe` the loader actually opens, usually under `steamapps/common/<Game>/`. A copy inside the Proton prefix (`steamapps/compatdata/<appid>/pfx/drive_c/...`) is a different file; select that path if the game is launched from it. `--steam <appid>` remains available when you prefer to match the Steam app instead.
 
-## 8. Run diagnostics
+## 8. Attach a running app by name
+
+If the app is already running, or you do not want to store its install path, use `--process`:
+
+```sh
+sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
+```
+
+No path and no wrapper are involved. The daemon matches the process `comm` or an argv basename, case-insensitively, and attaches it on the next poll. `netscope status` shows `name:Overwatch.exe` and `late`. Sockets opened before the attach keep their original route, so restart the app if you need every socket covered.
+
+## 9. Run diagnostics
 
 ```sh
 sudo netscope doctor

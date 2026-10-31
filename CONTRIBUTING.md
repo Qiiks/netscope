@@ -31,5 +31,5 @@ The public types live in `crates/netscope-linux/src/types.rs` and `protocol.rs`.
 - Keep changes focused and include the command you ran to verify them.
 - Add a test for a behavior change, or explain why the behavior cannot be tested without root.
 - Sign off commits with `git commit -s` (Developer Certificate of Origin).
-- Do not add telemetry, remote analytics, a hosted dashboard, or a network listener to v0.1.x.
+- Do not add telemetry, remote analytics, a hosted dashboard, or a network listener to v0.2.x.
 - Dual licensing is MIT OR Apache-2.0. Contributions are accepted under the same terms.

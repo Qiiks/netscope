@@ -15,6 +15,7 @@ pub const MAX_PROFILES: u8 = 32;
 pub enum Target {
     Native { path: String, dev: u64, ino: u64 },
     Wine { path: String, dev: u64, ino: u64 },
+    Name { name: String },
     Steam { app_id: u32 },
 }
 
@@ -23,6 +24,7 @@ pub enum Target {
 pub enum TargetSpec {
     Native { path: String },
     Wine { path: String },
+    Name { name: String },
     Steam { app_id: u32 },
 }
 
@@ -216,6 +218,26 @@ mod tests {
         assert_eq!(value["kind"], "wine");
         assert_eq!(
             serde_json::from_value::<Target>(value).expect("deserialize wine target"),
+            target
+        );
+    }
+
+    #[test]
+    fn name_targets_serde_with_kind_tag() {
+        let spec = TargetSpec::Name {
+            name: "Overwatch.exe".into(),
+        };
+        let value = serde_json::to_value(&spec).expect("serialize name spec");
+        assert_eq!(value["kind"], "name");
+        assert_eq!(value["name"], "Overwatch.exe");
+
+        let target = Target::Name {
+            name: "Overwatch.exe".into(),
+        };
+        let value = serde_json::to_value(&target).expect("serialize name target");
+        assert_eq!(value["kind"], "name");
+        assert_eq!(
+            serde_json::from_value::<Target>(value).expect("deserialize name target"),
             target
         );
     }

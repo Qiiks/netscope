@@ -63,7 +63,7 @@ Do not run privileged tests on a host with a live netscope service; stop it firs
 - Add a test for a behavior change, or explain why it cannot be tested without root.
 - Include the commands you ran to verify the change.
 - Update the docs in `docs/src` when behavior or the CLI changes. The docs are part of the change.
-- Do not add telemetry, remote analytics, a hosted dashboard, or a network listener to v0.1.x.
+- Do not add telemetry, remote analytics, a hosted dashboard, or a network listener to v0.2.x.
 - Do not add a wrapper, `LD_PRELOAD` shim, or proxy auto-configuration. The no-wrapper property is a design constraint.
 - Keep error messages actionable and free of secrets. UI text must not expose tokens or internal paths.
 

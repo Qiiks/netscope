@@ -13,6 +13,7 @@ pub struct AddInput {
     pub name: String,
     pub exe: Option<PathBuf>,
     pub wine: Option<PathBuf>,
+    pub process: Option<String>,
     pub steam: Option<u32>,
     pub filter: Option<String>,
     pub route: Option<String>,
@@ -48,8 +49,13 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 
 pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
     validate_name(&input.name)?;
-    let target = match (input.exe.as_deref(), input.wine.as_deref(), input.steam) {
-        (Some(path), None, None) => {
+    let target = match (
+        input.exe.as_deref(),
+        input.wine.as_deref(),
+        input.process.as_deref(),
+        input.steam,
+    ) {
+        (Some(path), None, None, None) => {
             let path = std::fs::canonicalize(path)
                 .map_err(|err| format!("cannot resolve --exe {}: {err}", path.display()))?;
             let path = path
@@ -59,7 +65,7 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
                 path: path.to_string(),
             }
         }
-        (None, Some(path), None) => {
+        (None, Some(path), None, None) => {
             let path = std::fs::canonicalize(path)
                 .map_err(|err| format!("cannot resolve --wine {}: {err}", path.display()))?;
             let path = path
@@ -69,14 +75,31 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
                 path: path.to_string(),
             }
         }
-        (None, None, Some(app_id)) => {
+        (None, None, Some(name), None) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("--process name must not be empty".to_string());
+            }
+            if name.contains('/') || name.contains('\\') {
+                return Err(
+                    "--process takes a process name, not a path; use --wine for a PE path"
+                        .to_string(),
+                );
+            }
+            TargetSpec::Name {
+                name: name.to_string(),
+            }
+        }
+        (None, None, None, Some(app_id)) => {
             if app_id == 0 {
                 return Err("--steam app id must be greater than zero".to_string());
             }
             TargetSpec::Steam { app_id }
         }
         _ => {
-            return Err("exactly one of --exe, --wine, or --steam is required".to_string());
+            return Err(
+                "exactly one of --exe, --wine, --process, or --steam is required".to_string(),
+            );
         }
     };
     let mode = validate_mode(ModeInput {
@@ -532,6 +555,37 @@ mod tests {
             }
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn process_name_target_builds_from_flag() {
+        let profile = build_add(AddInput {
+            name: "running-game".to_string(),
+            process: Some("Overwatch.exe".to_string()),
+            filter: Some("drop".to_string()),
+            target_uid: 1000,
+            ..AddInput::default()
+        })
+        .expect("name target");
+        assert_eq!(
+            profile.target,
+            TargetSpec::Name {
+                name: "Overwatch.exe".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn process_name_rejects_paths() {
+        let error = build_add(AddInput {
+            name: "bad".to_string(),
+            process: Some("/games/Overwatch.exe".to_string()),
+            filter: Some("drop".to_string()),
+            target_uid: 1000,
+            ..AddInput::default()
+        })
+        .expect_err("path is not a process name");
+        assert!(error.contains("not a path"));
     }
 
     #[test]

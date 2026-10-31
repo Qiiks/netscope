@@ -68,7 +68,7 @@ sysusers_file=$(pick "$here/netscope.sysusers" "$here/packaging/netscope.sysuser
 config_file=$(pick "$here/config.toml" "$here/packaging/config.toml") \
     || fail "config.toml not found"
 
-[ "$(uname -m)" = "x86_64" ] || fail "unsupported architecture $(uname -m); netscope v0.1.0 ships x86_64 only"
+[ "$(uname -m)" = "x86_64" ] || fail "unsupported architecture $(uname -m); netscope v0.2.0 ships x86_64 only"
 
 kernel=$(uname -r)
 kernel_release=${kernel%%-*}

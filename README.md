@@ -37,7 +37,19 @@ sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter dro
 sudo netscope --uid "$(id -u)" add game-routed --wine /games/Game/Game.exe --route tun0
 ```
 
-`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, and Steam apps are matched by app id.
+Or attach a **running** process by name, with no install path and no wrapper:
+
+```sh
+sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
+```
+
+`--process` matches a process's `comm` or an argv basename, so `Overwatch`,
+`Overwatch.exe`, and `overwatch.exe` are the same target. It attaches the
+running process on the next poll; sockets it opened before the attach keep
+their original route. Use `--exe` or `--wine` when you need attachment before
+the first socket.
+
+`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, name targets are caught on the poll, and Steam apps are matched by app id.
 
 ## How it works
 
@@ -45,7 +57,7 @@ sudo netscope --uid "$(id -u)" add game-routed --wine /games/Game/Game.exe --rou
 2. nftables matches `socket cgroupv2` for that profile and applies a filter or a routing mark.
 3. Route profiles set a dedicated routing table with a blackhole fallback. If the configured interface is down, traffic is dropped rather than leaking through the main table.
 
-A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, and Steam children when fanotify is unavailable. Existing sockets keep their old cgroup; restart the app for full coverage.
+A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, name targets, and Steam children. Name targets and existing sockets attach late — sockets opened before the attach keep their old cgroup; restart the app for full coverage.
 
 ## Security
 
