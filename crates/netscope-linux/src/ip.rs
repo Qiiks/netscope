@@ -190,7 +190,7 @@ pub fn table_in_use(table: u32) -> Result<bool, IpError> {
     if !(TABLE_BASE..=TABLE_BASE + 31).contains(&table) {
         return Ok(true);
     }
-    let value = show_json("-4", &["route", "show", "table", &table.to_string()])?;
+    let value = show_routes("-4", table)?;
     Ok(value.as_array().is_some_and(|entries| !entries.is_empty()))
 }
 
@@ -202,13 +202,36 @@ fn rules(family: i32) -> Result<Vec<RuleEntry>, IpError> {
 
 fn blackhole_default(family: i32, table: u32) -> Result<bool, IpError> {
     let flag = if family == 6 { "-6" } else { "-4" };
-    let value = show_json(flag, &["route", "show", "table", &table.to_string()])?;
+    let value = show_routes(flag, table)?;
     Ok(value.as_array().is_some_and(|entries| {
         entries.iter().any(|entry| {
             entry.get("type").and_then(Value::as_str) == Some("blackhole")
                 && entry.get("dst").and_then(Value::as_str) == Some("default")
         })
     }))
+}
+
+// `ip route show table N` exits 2 when the table has never been created;
+// treat that as an empty table rather than a command failure.
+fn show_routes(family_flag: &str, table: u32) -> Result<Value, IpError> {
+    let table = table.to_string();
+    let output = std::process::Command::new("ip")
+        .args([family_flag, "-j", "route", "show", "table", &table])
+        .output()
+        .map_err(|err| IpError::Command(err.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("FIB table does not exist") {
+            return Ok(Value::Array(Vec::new()));
+        }
+        return Err(IpError::Command(format!(
+            "ip exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| IpError::Command(format!("parse ip json: {err}")))
 }
 
 fn show_json(family_flag: &str, args: &[&str]) -> Result<Value, IpError> {

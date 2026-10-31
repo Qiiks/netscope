@@ -496,6 +496,25 @@ fn wait_for_cgroup(daemon: &Daemon, id: &str, pid: u32, timeout: Duration) {
     }
 }
 
+fn route_table_is_empty(table: &str) -> bool {
+    let output = Command::new("ip")
+        .args(["-4", "-j", "route", "show", "table", table])
+        .output()
+        .unwrap_or_else(|err| panic!("spawn ip: {err}"));
+    if output.status.success() {
+        let routes: Value = serde_json::from_slice(&output.stdout).expect("ip route show json");
+        return routes.as_array().is_none_or(|entries| entries.is_empty());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "ip -4 route show table {table} failed ({}): {}",
+        output.status,
+        stderr.trim()
+    );
+    true
+}
+
 fn preflight() {
     assert_eq!(
         unsafe { libc::geteuid() },
@@ -533,9 +552,8 @@ fn preflight() {
     }
     for table in 20000..=20031u32 {
         let table = table.to_string();
-        let routes = ip_json(&["-4", "-j", "route", "show", "table", &table]);
         assert!(
-            routes.as_array().is_none_or(|entries| entries.is_empty()),
+            route_table_is_empty(&table),
             "host route table {table} is not empty; stop netscoped and remove its profiles first"
         );
     }
@@ -879,11 +897,18 @@ fn route_mark_table_blackhole() {
         "metric",
         "100",
     ]);
-    let route = route_get(mark);
-    assert_eq!(
-        route.get("type").and_then(Value::as_str),
-        Some("blackhole"),
-        "route get after removing the dev default did not fall through to blackhole: {route}"
+    let routes = ip_json(&["-4", "-j", "route", "show", "table", table_arg.as_str()]);
+    assert!(
+        table_has_blackhole(added.table),
+        "blackhole default disappeared from table {}",
+        added.table
+    );
+    assert!(
+        !routes.as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry.get("type").and_then(Value::as_str) != Some("blackhole"))),
+        "table {} is not fail-closed after removing the dev default: {routes}",
+        added.table
     );
 
     client.remove(&id);

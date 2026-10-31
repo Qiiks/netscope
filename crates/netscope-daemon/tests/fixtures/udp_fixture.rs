@@ -24,7 +24,12 @@ fn send(dst: &str) {
         std::process::exit(3);
     }
     let socket = UdpSocket::bind("0.0.0.0:0").expect("bind sender");
-    socket.send_to(b"netscope-probe", dst).expect("send probe");
+    // A scoped filter profile rejects the send with EPERM; that is the drop.
+    match socket.send_to(b"netscope-probe", dst) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(err) => panic!("send probe: {err:?}"),
+    }
 }
 
 fn recv(port: &str) {
