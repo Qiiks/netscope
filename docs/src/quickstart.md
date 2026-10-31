@@ -47,7 +47,7 @@ netscope list
 sudo netscope status
 ```
 
-`list` shows `NAME`, `MODE`, `ENABLED`, `TARGET`, `ATTACHED`, and `PIDS` for every profile, including disabled ones. `status` adds the daemon and cgroup header. A process that was started before the profile was added appears as `late`; a process caught by the exec hook appears as `pre-exec`.
+`list` shows `NAME`, `MODE`, `ENABLED`, `TARGET`, `ATTACHED`, and `PIDS` for every profile, including disabled ones. `status` adds the daemon and cgroup header. A process that was started before the profile was added appears as `late`; a native app caught by the exec hook appears as `pre-exec`, and a Wine/Proton process caught opening the selected PE appears as `pre-open`.
 
 Short-lived commands are usually gone before you look, so `PIDS` may be empty even though the block applied.
 
@@ -65,7 +65,7 @@ With this profile, `https://1.1.1.1/` is allowed and every other destination is 
 
 ## 5. Select an app at launch
 
-The point of the exec hook is that nothing wraps the application. For example:
+The point of the pre-exec path is that nothing wraps the application. For example:
 
 ```sh
 sudo netscope --uid "$(id -u)" add browser --exe /usr/bin/firefox --filter allow --deny-cidr 192.168.0.0/16
@@ -92,7 +92,19 @@ sudo netscope --uid "$(id -u)" add routed --exe /usr/bin/curl --route tun0 --inc
 
 See [Route mode](modes/route.md) for the blackhole fallback and IPv6 behavior.
 
-## 7. Run diagnostics
+## 7. Route a Windows game through Wine or Proton
+
+Point `--wine` at the `.exe` itself, not at a `wine` binary or a launcher:
+
+```sh
+sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --route tun0
+```
+
+The path must be absolute, and the file must start with `MZ` — the DOS/PE header. Launch the game the way you normally do. When Wine opens the PE, the daemon holds the open, finds the Wine process whose command line names the PE, moves it into `netscope/game`, and then allows it. `netscope status` shows `pre-open` for that profile.
+
+For a Steam Proton game, select the `.exe` the loader actually opens, usually under `steamapps/common/<Game>/`. A copy inside the Proton prefix (`steamapps/compatdata/<appid>/pfx/drive_c/...`) is a different file; select that path if the game is launched from it. `--steam <appid>` remains available when you prefer to match the Steam app instead.
+
+## 8. Run diagnostics
 
 ```sh
 sudo netscope doctor
@@ -100,12 +112,13 @@ sudo netscope doctor
 
 `doctor` exits `0` when every check passes and `1` when any fails. Run it as root (`sudo netscope doctor`); without root the `root` check fails and doctor exits `1`. Add `--json` for machine-readable output. If it fails, see [Troubleshooting](troubleshooting.md).
 
-## 8. Clean up
+## 9. Clean up
 
 ```sh
 sudo netscope remove blocked
 sudo netscope remove browser
 sudo netscope remove routed
+sudo netscope remove game
 ```
 
 `remove` deletes the profile's nftables table, routing rules, routes, and cgroup. Removing a profile does not stop the application; traffic returns to normal routing immediately.

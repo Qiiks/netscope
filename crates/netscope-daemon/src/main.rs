@@ -584,13 +584,9 @@ fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
     }
     let mut healthy = true;
     if fanotify_active(rt) {
-        if let Target::Native { path, .. } = &profile.target {
-            if let Some(fanotify) = &rt.fanotify {
-                if let Err(err) = fanotify.add_mark(Path::new(path)) {
-                    warn!("fanotify mark profile={} error={err:?}", profile.id);
-                    healthy = false;
-                }
-            }
+        if let Err(err) = add_target_mark(rt, profile) {
+            warn!("fanotify mark profile={} error={err:?}", profile.id);
+            healthy = false;
         }
     }
     Ok(healthy)
@@ -598,7 +594,7 @@ fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
 
 fn reconcile_disabled(rt: &Rt, inner: &mut Inner, profile: &Profile) -> Result<bool, String> {
     if fanotify_active(rt) {
-        remove_native_mark(rt, profile);
+        remove_target_mark(rt, profile);
     }
     rt.nft.remove(profile).map_err(|err| err.to_string())?;
     if matches!(profile.mode, Mode::Route { .. }) {
@@ -779,6 +775,7 @@ fn attach_matches(rt: &Rt, inner: &mut Inner) {
         .collect();
     let mut matches = proc::scan_native(&profiles);
     matches.extend(proc::scan_steam(&profiles));
+    matches.extend(proc::scan_wine(&profiles));
     for (id, pid) in matches {
         attach_one(rt, inner, &id, pid, AttachSource::Late);
     }
@@ -818,15 +815,18 @@ fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
         let Some(profile) = inner.state.profiles.get(&id) else {
             continue;
         };
-        let Target::Native { path, dev, ino } = &profile.target else {
-            continue;
+        let is_wine = matches!(&profile.target, Target::Wine { .. });
+        let (path, old_dev, old_ino) = match &profile.target {
+            Target::Native { path, dev, ino } | Target::Wine { path, dev, ino } => {
+                (path.clone(), *dev, *ino)
+            }
+            Target::Steam { .. } => continue,
         };
-        let path = path.clone();
-        let (old_dev, old_ino) = (*dev, *ino);
+        let enabled = profile.enabled;
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
-                if profile.enabled {
+                if enabled {
                     warn!("executable missing profile={id} path={path}");
                 }
                 continue;
@@ -836,27 +836,33 @@ fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
             continue;
         }
         if fanotify_active(rt) {
-            if let Some(fanotify) = &rt.fanotify {
-                let _ = fanotify.remove_mark(Path::new(&path));
-            }
+            remove_target_mark(rt, profile);
         }
         if let Some(profile) = inner.state.profiles.get_mut(&id) {
-            profile.target = Target::Native {
-                path: path.clone(),
-                dev: metadata.dev(),
-                ino: metadata.ino(),
+            profile.target = if is_wine {
+                Target::Wine {
+                    path: path.clone(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                }
+            } else {
+                Target::Native {
+                    path: path.clone(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                }
             };
             profile.updated_at = now_rfc3339();
         }
         if fanotify_active(rt) {
-            if let Some(fanotify) = &rt.fanotify {
-                if let Err(err) = fanotify.add_mark(Path::new(&path)) {
+            if let Some(profile) = inner.state.profiles.get(&id) {
+                if let Err(err) = add_target_mark(rt, profile) {
                     warn!("fanotify mark profile={id} error={err:?}");
                 }
             }
         }
         changed += 1;
-        info!("executable updated profile={id} path={path}");
+        info!("target updated profile={id} path={path}");
     }
     changed
 }
@@ -918,13 +924,9 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
             }
         }
         if fanotify_active(rt) {
-            if let Target::Native { path, .. } = &profile.target {
-                if let Some(fanotify) = &rt.fanotify {
-                    if let Err(err) = fanotify.add_mark(Path::new(path)) {
-                        warn!("health profile={id} fanotify error={err:?}");
-                        healthy = false;
-                    }
-                }
+            if let Err(err) = add_target_mark(rt, &profile) {
+                warn!("health profile={id} fanotify error={err:?}");
+                healthy = false;
             }
         }
         if healthy {
@@ -992,14 +994,9 @@ async fn exec_task(mut rx: mpsc::Receiver<ExecEvent>, rt: Arc<Rt>) {
         warn!("fanotify disabled; poll-only");
     }
     let inner = rt.inner.lock().await;
-    if let Some(fanotify) = &rt.fanotify {
-        for profile in inner.state.profiles.values() {
-            if !profile.enabled {
-                continue;
-            }
-            if let Target::Native { path, .. } = &profile.target {
-                let _ = fanotify.remove_mark(Path::new(path));
-            }
+    for profile in inner.state.profiles.values() {
+        if profile.enabled {
+            remove_target_mark(&rt, profile);
         }
     }
 }
@@ -1007,6 +1004,7 @@ async fn exec_task(mut rx: mpsc::Receiver<ExecEvent>, rt: Arc<Rt>) {
 async fn handle_exec(rt: &Rt, event: ExecEvent) {
     let ExecEvent {
         pid,
+        mask,
         dev,
         ino,
         reply,
@@ -1027,38 +1025,102 @@ async fn handle_exec(rt: &Rt, event: ExecEvent) {
         .profiles
         .values()
         .find(|profile| {
-            profile.enabled
-                && matches!(
-                    &profile.target,
-                    Target::Native { dev: event_dev, ino: event_ino, .. }
-                        if *event_dev == dev && *event_ino == ino
-                )
+            if !profile.enabled {
+                return false;
+            }
+            match &profile.target {
+                Target::Native {
+                    dev: event_dev,
+                    ino: event_ino,
+                    ..
+                } => mask & libc::FAN_OPEN_EXEC_PERM != 0 && *event_dev == dev && *event_ino == ino,
+                Target::Wine {
+                    dev: event_dev,
+                    ino: event_ino,
+                    ..
+                } => mask & libc::FAN_OPEN_PERM != 0 && *event_dev == dev && *event_ino == ino,
+                Target::Steam { .. } => false,
+            }
         })
         .cloned();
     let allow = match profile {
         None => true,
-        Some(profile) => match cgroup::read_uid(pid) {
-            None => true,
-            Some(uid) if uid != profile.target_uid => true,
-            Some(_) => match rt
-                .cgroup
-                .attach_pid(&profile.id, pid, AttachSource::PreExec)
-            {
-                Ok(outcome) => {
-                    inner.provenance.insert(outcome.tgid, AttachSource::PreExec);
-                    info!("attach profile={} pid={pid} source=pre-exec", profile.id);
+        Some(profile) => {
+            let source = if matches!(&profile.target, Target::Wine { .. }) {
+                AttachSource::PreOpen
+            } else {
+                AttachSource::PreExec
+            };
+            if source == AttachSource::PreOpen {
+                // wineserver often opens the PE before the game process has
+                // its command line; never scope the shared server, attach the
+                // process that is actually running the selected PE.
+                let mut pids = Vec::new();
+                if proc::wine_pid_matches(&profile, pid) {
+                    pids.push(pid);
+                } else {
+                    pids.extend(
+                        proc::scan_wine(std::slice::from_ref(&profile))
+                            .into_iter()
+                            .map(|(_, pid)| pid),
+                    );
+                }
+                pids.sort_unstable();
+                pids.dedup();
+                if pids.is_empty() {
                     true
+                } else {
+                    pids.into_iter()
+                        .all(|pid| attach_event(rt, &mut inner, &profile, pid, source))
                 }
-                Err(CgroupError::ProcessGone(_)) => true,
-                Err(err) => {
-                    warn!("attach failed profile={} pid={pid} error={err}", profile.id);
-                    false
-                }
-            },
-        },
+            } else {
+                attach_event(rt, &mut inner, &profile, pid, source)
+            }
+        }
     };
     drop(inner);
     let _ = reply.send(allow);
+}
+
+fn attach_event(
+    rt: &Rt,
+    inner: &mut Inner,
+    profile: &Profile,
+    pid: u32,
+    source: AttachSource,
+) -> bool {
+    if rt
+        .cgroup
+        .procs(&profile.id)
+        .map(|pids| pids.contains(&pid))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match cgroup::read_uid(pid) {
+        None => true,
+        Some(uid) if uid != profile.target_uid => true,
+        Some(_) => match rt.cgroup.attach_pid(&profile.id, pid, source) {
+            Ok(outcome) => {
+                inner.provenance.insert(outcome.tgid, source);
+                info!(
+                    "attach profile={} pid={pid} source={}",
+                    profile.id,
+                    if source == AttachSource::PreOpen {
+                        "pre-open"
+                    } else {
+                        "pre-exec"
+                    }
+                );
+                true
+            }
+            Err(CgroupError::ProcessGone(_)) => true,
+            Err(err) => {
+                warn!("attach failed profile={} pid={pid} error={err}", profile.id);
+                false
+            }
+        },
+    }
 }
 
 async fn read_line_limited<R>(reader: &mut R, limit: usize) -> io::Result<Option<(Vec<u8>, bool)>>
@@ -1278,17 +1340,20 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
     pids.sort_unstable();
     pids.dedup();
     let mut pre_exec = false;
+    let mut pre_open = false;
     let mut late = false;
     for pid in &pids {
         match inner.provenance.get(pid) {
             Some(AttachSource::PreExec) => pre_exec = true,
+            Some(AttachSource::PreOpen) => pre_open = true,
             Some(AttachSource::Late) => late = true,
             None => {}
         }
     }
-    let attached = match (pre_exec, late) {
+    let attached = match (pre_exec || pre_open, late) {
         (true, true) => "mixed",
-        (true, false) => "pre-exec",
+        (true, false) if pre_exec => "pre-exec",
+        (true, false) => "pre-open",
         (false, true) => "late",
         (false, false) => "none",
     }
@@ -1302,7 +1367,7 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
     if profile.enabled && !healthy {
         warnings.push("profile unhealthy; run: sudo netscope doctor".to_string());
     }
-    if let Target::Native { path, .. } = &profile.target {
+    if let Target::Native { path, .. } | Target::Wine { path, .. } = &profile.target {
         if !fanotify_active(rt) {
             warnings.push("fanotify unavailable; poll-only".to_string());
         }
@@ -1319,6 +1384,7 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         enabled: profile.enabled,
         target: match &profile.target {
             Target::Native { path, .. } => path.clone(),
+            Target::Wine { path, .. } => format!("wine:{path}"),
             Target::Steam { app_id } => format!("steam:{app_id}"),
         },
         cgroup: rt.cgroup.root().join(&profile.id).display().to_string(),
@@ -1421,13 +1487,7 @@ fn apply_profile(rt: &Rt, profile: &Profile) -> Result<(), String> {
         ip::ensure(profile).map_err(|err| err.to_string())?;
     }
     if fanotify_active(rt) {
-        if let Target::Native { path, .. } = &profile.target {
-            if let Some(fanotify) = &rt.fanotify {
-                fanotify
-                    .add_mark(Path::new(path))
-                    .map_err(|err| err.to_string())?;
-            }
-        }
+        add_target_mark(rt, profile).map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -1437,20 +1497,32 @@ fn rollback_profile(rt: &Rt, profile: &Profile) {
         let _ = ip::remove(profile);
     }
     let _ = rt.nft.remove(profile);
-    remove_native_mark(rt, profile);
+    remove_target_mark(rt, profile);
     let _ = rt.cgroup.remove(&profile.id);
 }
 
-fn remove_native_mark(rt: &Rt, profile: &Profile) {
-    if !fanotify_active(rt) {
-        return;
+fn add_target_mark(rt: &Rt, profile: &Profile) -> Result<(), FanotifyError> {
+    let Some(fanotify) = &rt.fanotify else {
+        return Ok(());
+    };
+    match &profile.target {
+        Target::Native { path, .. } => fanotify.add_exec_mark(Path::new(path)),
+        Target::Wine { path, .. } => fanotify.add_open_mark(Path::new(path)),
+        Target::Steam { .. } => Ok(()),
     }
-    if let Target::Native { path, .. } = &profile.target {
-        if let Some(fanotify) = &rt.fanotify {
-            if let Err(err) = fanotify.remove_mark(Path::new(path)) {
-                debug!("fanotify unmark profile={} error={err:?}", profile.id);
-            }
-        }
+}
+
+fn remove_target_mark(rt: &Rt, profile: &Profile) {
+    let Some(fanotify) = &rt.fanotify else {
+        return;
+    };
+    let result = match &profile.target {
+        Target::Native { path, .. } => fanotify.remove_exec_mark(Path::new(path)),
+        Target::Wine { path, .. } => fanotify.remove_open_mark(Path::new(path)),
+        Target::Steam { .. } => Ok(()),
+    };
+    if let Err(err) = result {
+        debug!("fanotify unmark profile={} error={err:?}", profile.id);
     }
 }
 
@@ -1475,7 +1547,7 @@ async fn remove_profile(rt: &Arc<Rt>, peer_uid: u32, id: &str) -> Result<(), Str
         save_state(&rt.cfg.daemon.state_path, &inner.state)
             .map_err(|err| format!("state: write failed: {err}"))?;
     }
-    remove_native_mark(rt, &profile);
+    remove_target_mark(rt, &profile);
     if let Err(err) = rt.nft.remove(&profile) {
         warn!("remove profile={id} nft error={err}");
     }
@@ -1526,7 +1598,7 @@ async fn set_enabled(
             stored.updated_at = now_rfc3339();
         }
         if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
-            remove_native_mark(rt, &profile);
+            remove_target_mark(rt, &profile);
             let _ = rt.nft.remove(&profile);
             if matches!(profile.mode, Mode::Route { .. }) {
                 let _ = ip::remove(&profile);
@@ -1540,7 +1612,7 @@ async fn set_enabled(
         inner.health.insert(id.to_string(), true);
         attach_matches(rt, &mut inner);
     } else {
-        remove_native_mark(rt, &profile);
+        remove_target_mark(rt, &profile);
         if let Err(err) = rt.nft.remove(&profile) {
             warn!("disable profile={id} nft error={err}");
         }
@@ -1729,6 +1801,34 @@ fn resolve_target(spec: &TargetSpec) -> Result<Target, String> {
                 ino: metadata.ino(),
             })
         }
+        TargetSpec::Wine { path } => {
+            if !Path::new(path).is_absolute() {
+                return Err(format!("target {path} must be an absolute path"));
+            }
+            let canonical =
+                fs::canonicalize(path).map_err(|err| format!("invalid target {path}: {err}"))?;
+            reject_daemon_tool(&canonical)?;
+            let metadata =
+                fs::metadata(&canonical).map_err(|err| format!("invalid target {path}: {err}"))?;
+            if !metadata.is_file() {
+                return Err(format!("target {path} is not a file"));
+            }
+            let mut head = [0u8; 2];
+            File::open(&canonical)
+                .and_then(|mut file| file.read_exact(&mut head))
+                .map_err(|err| format!("invalid target {path}: {err}"))?;
+            if &head != b"MZ" {
+                return Err(format!("target {path} is not a Windows PE executable"));
+            }
+            let canonical_path = canonical
+                .to_str()
+                .ok_or_else(|| format!("target {path} is not valid UTF-8"))?;
+            Ok(Target::Wine {
+                path: canonical_path.to_string(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
     }
 }
 
@@ -1753,6 +1853,16 @@ fn duplicate_target(profiles: &BTreeMap<ProfileId, Profile>, target: &Target) ->
             (
                 Target::Native { dev, ino, .. },
                 Target::Native {
+                    dev: existing_dev,
+                    ino: existing_ino,
+                    ..
+                },
+            ) if dev == existing_dev && ino == existing_ino => {
+                return Some(profile.id.clone());
+            }
+            (
+                Target::Wine { dev, ino, .. },
+                Target::Wine {
                     dev: existing_dev,
                     ino: existing_ino,
                     ..

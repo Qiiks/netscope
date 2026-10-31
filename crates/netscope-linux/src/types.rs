@@ -14,6 +14,7 @@ pub const MAX_PROFILES: u8 = 32;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
     Native { path: String, dev: u64, ino: u64 },
+    Wine { path: String, dev: u64, ino: u64 },
     Steam { app_id: u32 },
 }
 
@@ -21,6 +22,7 @@ pub enum Target {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetSpec {
     Native { path: String },
+    Wine { path: String },
     Steam { app_id: u32 },
 }
 
@@ -135,6 +137,7 @@ impl Default for DaemonConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachSource {
     PreExec,
+    PreOpen,
     Late,
 }
 
@@ -194,6 +197,27 @@ mod tests {
         assert!(!profile_id_valid("Game"));
         assert!(!profile_id_valid("-game"));
         assert!(!profile_id_valid("a".repeat(33).as_str()));
+    }
+
+    #[test]
+    fn wine_targets_serde_with_kind_tag() {
+        let spec = TargetSpec::Wine {
+            path: "/games/foo.exe".into(),
+        };
+        let value = serde_json::to_value(&spec).expect("serialize wine spec");
+        assert_eq!(value["kind"], "wine");
+
+        let target = Target::Wine {
+            path: "/games/foo.exe".into(),
+            dev: 42,
+            ino: 7,
+        };
+        let value = serde_json::to_value(&target).expect("serialize wine target");
+        assert_eq!(value["kind"], "wine");
+        assert_eq!(
+            serde_json::from_value::<Target>(value).expect("deserialize wine target"),
+            target
+        );
     }
 
     #[test]

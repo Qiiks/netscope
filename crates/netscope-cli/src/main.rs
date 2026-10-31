@@ -5,7 +5,7 @@ mod diagnostics;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use netscope_linux::types::{BundleArgs, DoctorArgs};
 
 // diagnostics keeps `support_bundle` for default-options callers; main always
@@ -28,6 +28,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Parsed once at startup; boxing arguments would only add indirection.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Show the daemon and its profiles
     Status {
@@ -39,7 +41,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Scope a native executable or Steam app
+    /// Scope a native executable, Wine/Proton PE, or Steam app
     Add(AddArgs),
     /// Remove a profile and its rules
     Remove { name: String },
@@ -87,21 +89,19 @@ enum Cmd {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("target")
+        .required(true)
+        .multiple(false)
+        .args(["exe", "wine", "steam"]),
+))]
 struct AddArgs {
     name: String,
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "steam",
-        required_unless_present = "steam"
-    )]
+    #[arg(long, value_name = "PATH")]
     exe: Option<PathBuf>,
-    #[arg(
-        long,
-        value_name = "APPID",
-        conflicts_with = "exe",
-        required_unless_present = "exe"
-    )]
+    #[arg(long, value_name = "PATH")]
+    wine: Option<PathBuf>,
+    #[arg(long, value_name = "APPID")]
     steam: Option<u32>,
     #[arg(
         long,
@@ -200,6 +200,7 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
     let input = commands::AddInput {
         name: args.name,
         exe: args.exe,
+        wine: args.wine,
         steam: args.steam,
         filter: args.filter,
         route: args.route,

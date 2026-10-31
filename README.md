@@ -30,15 +30,22 @@ Route a selected app through a tunnel interface:
 sudo netscope --uid "$(id -u)" add routed --exe /usr/bin/curl --route tun0
 ```
 
-`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required for native ELF apps; Steam apps are matched by app id.
+Scope a Windows game launched through Wine or Proton by selecting the `.exe`:
+
+```sh
+sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter drop
+sudo netscope --uid "$(id -u)" add game-routed --wine /games/Game/Game.exe --route tun0
+```
+
+`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, and Steam apps are matched by app id.
 
 ## How it works
 
-1. `fanotify` holds an `exec` of a selected inode until the daemon has moved the process into `/sys/fs/cgroup/netscope/<profile>`.
+1. `fanotify` holds an `exec` of a selected native inode — or the first open of a selected Windows PE by a Wine/Proton loader — until the daemon has moved the process into `/sys/fs/cgroup/netscope/<profile>`.
 2. nftables matches `socket cgroupv2` for that profile and applies a filter or a routing mark.
 3. Route profiles set a dedicated routing table with a blackhole fallback. If the configured interface is down, traffic is dropped rather than leaking through the main table.
 
-A polling fallback attaches already-running processes and Steam children when fanotify is unavailable. Existing sockets keep their old cgroup; restart the app for full coverage.
+A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, and Steam children when fanotify is unavailable. Existing sockets keep their old cgroup; restart the app for full coverage.
 
 ## Security
 

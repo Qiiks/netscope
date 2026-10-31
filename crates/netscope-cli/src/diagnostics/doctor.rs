@@ -432,7 +432,7 @@ fn validate_state(state: &State, max_profiles: u8) -> Vec<String> {
             ));
         }
         match &profile.target {
-            Target::Native { path, .. } => {
+            Target::Native { path, .. } | Target::Wine { path, .. } => {
                 if !path.starts_with('/') {
                     problems.push(format!("profile '{id}' target path is not absolute"));
                 }

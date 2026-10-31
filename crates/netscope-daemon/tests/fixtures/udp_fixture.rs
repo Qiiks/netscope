@@ -14,8 +14,15 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("send") => send(args.get(2).expect("destination")),
         Some("recv") => recv(args.get(2).expect("port")),
+        Some("open-sleep") => open_sleep(args.get(2).expect("pe path")),
         _ => std::process::exit(2),
     }
+}
+
+fn open_sleep(path: &str) {
+    std::fs::File::open(path).expect("open PE");
+    println!("opened");
+    std::thread::sleep(Duration::from_secs(30));
 }
 
 fn send(dst: &str) {

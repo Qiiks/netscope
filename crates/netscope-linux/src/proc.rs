@@ -52,6 +52,56 @@ pub fn scan_steam(profiles: &[Profile]) -> Vec<(String, u32)> {
     found
 }
 
+/// Wine targets whose PE path appears in a running Wine process's cmdline.
+pub fn scan_wine(profiles: &[Profile]) -> Vec<(String, u32)> {
+    let mut found = Vec::new();
+    for pid in pids() {
+        if pid == 1 || pid == std::process::id() {
+            continue;
+        }
+        for profile in profiles {
+            if wine_pid_matches(profile, pid) {
+                found.push((profile.id.clone(), pid));
+            }
+        }
+    }
+    found
+}
+
+/// True when `pid` is a Wine process running the profile's PE.
+pub fn wine_pid_matches(profile: &Profile, pid: u32) -> bool {
+    let Target::Wine { path, .. } = &profile.target else {
+        return false;
+    };
+    if !is_wine_process(pid) {
+        return false;
+    }
+    let Some(uid) = crate::cgroup::read_uid(pid) else {
+        return false;
+    };
+    if uid != profile.target_uid {
+        return false;
+    }
+    let Some(args) = cmdline(pid) else {
+        return false;
+    };
+    args.iter().any(|arg| wine_arg_matches(path, arg))
+}
+
+/// True when `pid` runs one of the Wine loader/server executables.
+pub fn is_wine_process(pid: u32) -> bool {
+    let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "wine" | "wine64" | "wine-preloader" | "wine64-preloader"
+    ) || name.contains("wine-preloader")
+}
+
 pub fn start_time(pid: u32) -> Option<u64> {
     crate::cgroup::read_start_time(pid)
 }
@@ -71,6 +121,45 @@ fn matches_steam(target: &Target, target_uid: u32, uid: u32, ids: &[u32]) -> boo
             target,
             Target::Steam { app_id } if ids.contains(app_id)
         )
+}
+
+/// Match one Wine command-line argument against the configured PE path.
+///
+/// Wine passes the executable path in one of several shapes: the Unix path,
+/// a `Z:\` mapping of `/`, a `C:\` path inside the prefix's `drive_c`, or a
+/// bare name resolved through `PATH`.
+fn wine_arg_matches(target: &str, arg: &str) -> bool {
+    let target = target.replace('\\', "/").to_lowercase();
+    let arg = arg.replace('\\', "/").to_lowercase();
+    if arg.is_empty() {
+        return false;
+    }
+    if arg == target {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix("z:/") {
+        return target == format!("/{rest}");
+    }
+    if let Some(rest) = arg.strip_prefix("c:/") {
+        return target
+            .split_once("/drive_c/")
+            .is_some_and(|(_, mapped)| mapped == rest);
+    }
+    if !arg.contains('/') {
+        return target.rsplit('/').next() == Some(arg.as_str());
+    }
+    false
+}
+
+fn cmdline(pid: u32) -> Option<Vec<String>> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
 }
 
 fn pids() -> Vec<u32> {
@@ -132,6 +221,31 @@ mod tests {
     #[test]
     fn current_process_has_start_time() {
         assert!(start_time(std::process::id()).is_some_and(|time| time > 0));
+    }
+
+    #[test]
+    fn wine_args_match_linux_and_nt_paths() {
+        let target = "/home/u/Games/foo/foo.exe";
+        assert!(wine_arg_matches(target, target));
+        assert!(wine_arg_matches(target, "Z:\\home\\u\\Games\\foo\\foo.exe"));
+        assert!(wine_arg_matches(target, "/HOME/U/games/FOO/FOO.EXE"));
+        assert!(wine_arg_matches(target, "foo.exe"));
+        assert!(!wine_arg_matches(target, "bar.exe"));
+        assert!(!wine_arg_matches(target, "/home/u/Games/bar/foo.exe"));
+        assert!(!wine_arg_matches(target, ""));
+    }
+
+    #[test]
+    fn wine_args_match_drive_c_prefix() {
+        let target = "/home/u/.local/share/Steam/steamapps/compatdata/1/pfx/drive_c/Games/foo.exe";
+        assert!(wine_arg_matches(target, "C:\\Games\\foo.exe"));
+        assert!(!wine_arg_matches(target, "C:\\Games\\bar.exe"));
+        assert!(!wine_arg_matches("/opt/foo.exe", "C:\\foo.exe"));
+    }
+
+    #[test]
+    fn current_process_is_not_wine() {
+        assert!(!is_wine_process(std::process::id()));
     }
 
     #[test]

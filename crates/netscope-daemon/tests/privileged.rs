@@ -13,7 +13,7 @@
 //! policy rule is left behind.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -143,6 +143,10 @@ struct Daemon {
 
 impl Daemon {
     fn new(name: &str) -> Self {
+        Self::new_with_poll(name, 100)
+    }
+
+    fn new_with_poll(name: &str, poll_interval_ms: u64) -> Self {
         let pid = std::process::id();
         let temp = PathBuf::from(format!("/tmp/netscope-priv-{pid}-{name}"));
         let _ = fs::remove_dir_all(&temp);
@@ -160,7 +164,7 @@ impl Daemon {
         fs::write(
             &config,
             format!(
-                "[daemon]\nsocket_path = \"{}\"\nstate_path = \"{}\"\ncgroup_root = \"{}\"\npoll_interval_ms = 100\nrefresh_interval_secs = 1\nmax_profiles = 8\nlog_level = \"info\"\n",
+                "[daemon]\nsocket_path = \"{}\"\nstate_path = \"{}\"\ncgroup_root = \"{}\"\npoll_interval_ms = {poll_interval_ms}\nrefresh_interval_secs = 1\nmax_profiles = 8\nlog_level = \"info\"\n",
                 socket.display(),
                 state.display(),
                 cgroup_root.display()
@@ -779,6 +783,133 @@ fn fanotify_pre_exec_attach() {
     }
 
     client.remove(&id);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn wine_pre_open_attach() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    preflight();
+    // The poll loop must not win the race this test is about.
+    let mut daemon = Daemon::new_with_poll("wine", 10_000);
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let (fixture, _) = build_fixture(&daemon.temp);
+
+    let pe = daemon.temp.join("game.exe");
+    fs::write(&pe, b"MZ\x90\x00fake pe").expect("write fake PE");
+    let pe_canonical = fs::canonicalize(&pe).expect("canonical PE");
+
+    let id = format!("wine-{pid}");
+    let added = client.add(
+        &id,
+        TargetSpec::Wine {
+            path: pe.display().to_string(),
+        },
+        filter_drop(),
+        0,
+    );
+    daemon.track_profile(&id, &added);
+    assert!(
+        !added
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("fanotify unavailable")),
+        "fanotify unavailable, cannot prove pre-open attach: {:?}",
+        added.warnings
+    );
+
+    // A loader-shaped copy exercises the Wine-process guard without Wine.
+    let loader = daemon.temp.join("wine64-preloader");
+    fs::copy(&fixture, &loader).expect("copy wine loader");
+    fs::set_permissions(&loader, fs::Permissions::from_mode(0o755)).expect("chmod wine loader");
+
+    let mut child = Command::new(&loader)
+        .arg("open-sleep")
+        .arg(&pe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wine loader");
+    let child_pid = child.id();
+    daemon.track_pid(child_pid);
+
+    let mut opened = String::new();
+    BufReader::new(child.stdout.take().expect("loader stdout"))
+        .read_line(&mut opened)
+        .expect("read loader output");
+    assert_eq!(
+        opened.trim(),
+        "opened",
+        "wine loader did not finish its open\n{}",
+        daemon.log_tail()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let profiles = client.list();
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .expect("wine profile in list");
+        if profile.pids.contains(&child_pid) {
+            assert_eq!(
+                profile.attached, "pre-open",
+                "expected pre-open attach, got {} (warnings: {:?})",
+                profile.attached, profile.warnings
+            );
+            assert_eq!(
+                profile.target,
+                format!("wine:{}", pe_canonical.display()),
+                "wine profile target label"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid {child_pid} not attached within 1 s: {profile:?}\n{}",
+            daemon.log_tail()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The same PE opened by a non-Wine process must be allowed and unscoped.
+    let other = daemon.temp.join("not-wine");
+    fs::copy(&fixture, &other).expect("copy non-wine opener");
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).expect("chmod non-wine opener");
+    let mut other_child = Command::new(&other)
+        .arg("open-sleep")
+        .arg(&pe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn non-wine opener");
+    let other_pid = other_child.id();
+    daemon.track_pid(other_pid);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !cgroup_procs(&daemon.cgroup_root, &id).contains(&other_pid),
+        "non-Wine opener {other_pid} was scoped\n{}",
+        daemon.log_tail()
+    );
+    assert!(
+        other_child
+            .try_wait()
+            .expect("non-wine opener status")
+            .is_none(),
+        "non-Wine opener was not allowed through its open\n{}",
+        daemon.log_tail()
+    );
+
+    client.remove(&id);
+    let _ = other_child.kill();
+    let _ = other_child.wait();
     let _ = child.kill();
     let _ = child.wait();
 }

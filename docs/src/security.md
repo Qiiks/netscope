@@ -39,6 +39,7 @@ Before any host change, the daemon validates:
 
 - **Profile IDs:** 1–32 characters, `[a-z0-9][a-z0-9-]*`. The ID is used in cgroup and nftables table names, and `-` is mapped to `_` for nftables.
 - **Executable paths:** canonicalized. The daemon records the device and inode and matches on that identity, re-resolving it when the file at the recorded path changes.
+- **Windows PE paths:** `--wine` takes an absolute path. The daemon canonicalizes it, requires a regular file, and requires the first two bytes to be `MZ` before recording its device and inode. No ELF check is applied.
 - **Steam app IDs:** numeric, within the profile target type.
 - **CIDRs:** parsed as IPv4 or IPv6 networks. Invalid input is rejected, not passed through.
 - **Interfaces and gateways:** passed as separate arguments to `ip`; no shell is involved.
@@ -61,7 +62,8 @@ A root daemon is a real risk if it has a bug. Reduce exposure:
 
 netscope scopes traffic from processes it successfully attaches to a profile cgroup. It does **not** protect:
 
-- **Sockets opened before attachment.** An existing TCP connection keeps its original cgroup and is not matched. Restart the app.
+- **Sockets opened before attachment.** An existing TCP connection keeps its original cgroup and is not matched. Restart the app. For a Wine target this includes sockets the loader opened before it opened the PE.
+- **Non-Wine processes that open a selected PE.** A `--wine` profile marks the file, so the daemon sees every open of it, but it attaches only a Wine process whose command line names the selected PE. Any other process that opens the same file — a file manager, an indexer, a scanner — is allowed and left unscoped. `wineserver` is never attached; it may open the PE for a loader, but it is shared across Wine applications. Children the attached process starts stay in the same cgroup.
 - **Processes that escape attachment.** A process that was never matched by the exec hook or the poller is unscoped. Privileged processes can move themselves out of the cgroup; netscope does not fight that.
 - **Kernel-generated traffic with no local socket.** Forwarded packets, some ICMP errors, and other locally generated traffic that is not attributed to a socket in the cgroup are not matched.
 - **Traffic forwarded for another host.** A router or NAT workload forwarding packets on behalf of another machine is out of scope.

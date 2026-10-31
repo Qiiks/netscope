@@ -18,7 +18,7 @@ This is a scope decision, not a claim that eBPF is unsuitable for every workload
 
 ## Is there a wrapper?
 
-No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. Selection happens at `exec` through fanotify, or by polling if fanotify is unavailable.
+No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. A native app is selected at `exec` through fanotify; a Windows PE is selected when Wine opens it; otherwise the poller catches it late.
 
 ## What about applications that are already running?
 
@@ -56,7 +56,7 @@ Not in v0.1.0. Remove it and add it again with the new target or mode. `enable` 
 
 ## Can one profile cover several applications?
 
-No. One profile has one target: an executable or a Steam app ID. Use separate profiles, up to 32.
+No. One profile has one target: a native executable, a Windows PE run through Wine/Proton, or a Steam app ID. Use separate profiles, up to 32.
 
 ## Can two profiles target the same application?
 
@@ -77,6 +77,16 @@ netscope does not rewrite DNS. In filter mode, allow the resolver's address if t
 ## Does it work with Steam games?
 
 Yes, with `--steam <appid>`. Add the profile before launching the game and launch it through Steam. If Steam was already running, restart it so the game's process is attached before it opens sockets.
+
+## Does it work with Wine, Proton, or Windows games?
+
+Yes, with `--wine <path>` pointing at the `.exe`. The path must be absolute, and the file must start with `MZ`. netscope marks that PE; when Wine opens it, the daemon holds the open, finds the Wine process whose command line names the PE, moves that process into the profile cgroup, and then allows it. `status` shows `pre-open`.
+
+Only a Wine process running the selected PE is attached. Another program that opens the same `.exe` — a file manager, a scanner, a copy — is allowed and left unscoped. `wineserver` is never attached: it may open the PE on behalf of a loader, but it is a shared server, not the game.
+
+If fanotify cannot be used, the fallback matches Wine processes by command line, including `Z:\...` paths and the `C:\...`/`/drive_c/` form, and attaches late. Sockets opened during startup can then escape, so restart the game after the profile attaches.
+
+For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
 
 ## Is it a firewall?
 

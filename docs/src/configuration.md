@@ -49,7 +49,7 @@ The CLI accepts a hidden `--socket <path>` override. It exists for tests and for
 
 ## State file
 
-`state_path` holds a versioned JSON document with one entry per profile. It stores the target path and inode identity, the mode, the profile's mark, table, priority, and index, and timestamps. The daemon owns it:
+`state_path` holds a versioned JSON document with one entry per profile. It stores the target kind and identity — a native executable path, a Windows PE path for a `--wine` profile, or a Steam app ID — the mode, the profile's mark, table, priority, and index, and timestamps. A Wine entry records the canonical PE path with its device and inode, so the daemon can re-stat the file and move the fanotify open mark when it is replaced. The daemon owns it:
 
 - Do not edit it while `netscoped` is running.
 - Back it up before an upgrade if you have profiles you cannot recreate easily.

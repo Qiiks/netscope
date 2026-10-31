@@ -31,6 +31,7 @@ pub struct ExecEvent {
     pub pid: u32,
     pub pidfd: Option<OwnedFd>,
     pub event_fd: OwnedFd,
+    pub mask: u64,
     pub dev: u64,
     pub ino: u64,
     pub path: PathBuf,
@@ -44,6 +45,7 @@ impl fmt::Debug for ExecEvent {
             .field("pid", &self.pid)
             .field("pidfd", &self.pidfd)
             .field("event_fd", &self.event_fd)
+            .field("mask", &self.mask)
             .field("dev", &self.dev)
             .field("ino", &self.ino)
             .field("path", &self.path)
@@ -105,22 +107,30 @@ impl Fanotify {
         Ok(Self { fd, stop })
     }
 
-    pub fn add_mark(&self, path: &Path) -> Result<(), FanotifyError> {
-        self.mark(path, libc::FAN_MARK_ADD)
+    pub fn add_exec_mark(&self, path: &Path) -> Result<(), FanotifyError> {
+        self.mark(path, libc::FAN_MARK_ADD, libc::FAN_OPEN_EXEC_PERM)
     }
 
-    pub fn remove_mark(&self, path: &Path) -> Result<(), FanotifyError> {
-        self.mark(path, libc::FAN_MARK_REMOVE)
+    pub fn remove_exec_mark(&self, path: &Path) -> Result<(), FanotifyError> {
+        self.mark(path, libc::FAN_MARK_REMOVE, libc::FAN_OPEN_EXEC_PERM)
     }
 
-    fn mark(&self, path: &Path, operation: libc::c_uint) -> Result<(), FanotifyError> {
+    pub fn add_open_mark(&self, path: &Path) -> Result<(), FanotifyError> {
+        self.mark(path, libc::FAN_MARK_ADD, libc::FAN_OPEN_PERM)
+    }
+
+    pub fn remove_open_mark(&self, path: &Path) -> Result<(), FanotifyError> {
+        self.mark(path, libc::FAN_MARK_REMOVE, libc::FAN_OPEN_PERM)
+    }
+
+    fn mark(&self, path: &Path, operation: libc::c_uint, mask: u64) -> Result<(), FanotifyError> {
         let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| FanotifyError::Invalid("mark path contains NUL".into()))?;
         let result = unsafe {
             libc::fanotify_mark(
                 self.fd.as_raw_fd(),
                 operation | libc::FAN_MARK_INODE,
-                libc::FAN_OPEN_EXEC_PERM,
+                mask,
                 libc::AT_FDCWD,
                 path.as_ptr(),
             )
@@ -288,6 +298,7 @@ fn parse_events(bytes: &[u8], events: &mut Vec<ExecEvent>) -> Result<(), Fanotif
                 pid: 0,
                 pidfd: None,
                 event_fd: null_fd()?,
+                mask: 0,
                 dev: 0,
                 ino: 0,
                 path: PathBuf::new(),
@@ -353,6 +364,7 @@ fn parse_events(bytes: &[u8], events: &mut Vec<ExecEvent>) -> Result<(), Fanotif
             pid,
             pidfd,
             event_fd,
+            mask,
             dev,
             ino,
             path,

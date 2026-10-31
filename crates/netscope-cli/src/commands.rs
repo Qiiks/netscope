@@ -12,6 +12,7 @@ use crate::client::{self, ClientError};
 pub struct AddInput {
     pub name: String,
     pub exe: Option<PathBuf>,
+    pub wine: Option<PathBuf>,
     pub steam: Option<u32>,
     pub filter: Option<String>,
     pub route: Option<String>,
@@ -47,8 +48,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 
 pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
     validate_name(&input.name)?;
-    let target = match (input.exe.as_deref(), input.steam) {
-        (Some(path), None) => {
+    let target = match (input.exe.as_deref(), input.wine.as_deref(), input.steam) {
+        (Some(path), None, None) => {
             let path = std::fs::canonicalize(path)
                 .map_err(|err| format!("cannot resolve --exe {}: {err}", path.display()))?;
             let path = path
@@ -58,14 +59,25 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
                 path: path.to_string(),
             }
         }
-        (None, Some(app_id)) => {
+        (None, Some(path), None) => {
+            let path = std::fs::canonicalize(path)
+                .map_err(|err| format!("cannot resolve --wine {}: {err}", path.display()))?;
+            let path = path
+                .to_str()
+                .ok_or_else(|| "--wine path is not valid UTF-8".to_string())?;
+            TargetSpec::Wine {
+                path: path.to_string(),
+            }
+        }
+        (None, None, Some(app_id)) => {
             if app_id == 0 {
                 return Err("--steam app id must be greater than zero".to_string());
             }
             TargetSpec::Steam { app_id }
         }
-        (Some(_), Some(_)) => return Err("--exe and --steam are mutually exclusive".to_string()),
-        (None, None) => return Err("one of --exe or --steam is required".to_string()),
+        _ => {
+            return Err("exactly one of --exe, --wine, or --steam is required".to_string());
+        }
     };
     let mode = validate_mode(ModeInput {
         filter: input.filter.as_deref(),
@@ -498,6 +510,43 @@ mod tests {
         })
         .expect_err("gateway6 without ipv6");
         assert!(error.contains("--allow-ipv6"));
+    }
+
+    #[test]
+    fn wine_target_builds_from_flag() {
+        let path = std::env::temp_dir().join(format!("netscope-wine-{}.exe", std::process::id()));
+        std::fs::write(&path, b"MZ").expect("write fake PE");
+        let profile = build_add(AddInput {
+            name: "wine-app".to_string(),
+            wine: Some(path.clone()),
+            filter: Some("drop".to_string()),
+            target_uid: 1000,
+            ..AddInput::default()
+        })
+        .expect("wine target");
+        let canonical = std::fs::canonicalize(&path).expect("canonical PE");
+        assert_eq!(
+            profile.target,
+            TargetSpec::Wine {
+                path: canonical.to_str().expect("utf8 path").to_string(),
+            }
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exactly_one_target_flag_is_required() {
+        let exe = PathBuf::from("/bin/true");
+        let error = build_add(AddInput {
+            name: "both".to_string(),
+            exe: Some(exe.clone()),
+            wine: Some(exe),
+            filter: Some("drop".to_string()),
+            target_uid: 1000,
+            ..AddInput::default()
+        })
+        .expect_err("exe and wine conflict");
+        assert!(error.contains("exactly one"));
     }
 
     #[test]
