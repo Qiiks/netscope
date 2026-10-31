@@ -45,19 +45,19 @@ sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 
 `--process` matches a process's `comm` or an argv basename, so `Overwatch`,
 `Overwatch.exe`, and `overwatch.exe` are the same target. It attaches the
-running process on the next poll; sockets it opened before the attach keep
-their original route. Use `--exe` or `--wine` when you need attachment before
-the first socket.
+running process on the next poll and marks the sockets it already holds, so a
+restart is not required. Use `--exe` or `--wine` when the first packet must be
+caught before the poll.
 
 `netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, name targets are caught on the poll, and Steam apps are matched by app id.
 
 ## How it works
 
 1. `fanotify` holds an `exec` of a selected native inode — or the first open of a selected Windows PE by a Wine/Proton loader — until the daemon has moved the process into `/sys/fs/cgroup/netscope/<profile>`.
-2. nftables matches `socket cgroupv2` for that profile and applies a filter or a routing mark.
+2. nftables matches `socket cgroupv2` or the profile's `socket mark` and applies a filter or a routing mark.
 3. Route profiles set a dedicated routing table with a blackhole fallback. If the configured interface is down, traffic is dropped rather than leaking through the main table.
 
-A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, name targets, and Steam children. Name targets and existing sockets attach late — sockets opened before the attach keep their old cgroup; restart the app for full coverage.
+A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, name targets, and Steam children. When a process is attached late, the daemon marks its existing sockets with the profile mark; the nftables rules match either the cgroup or that mark, so those sockets change route on the next packet without a restart.
 
 ## Security
 

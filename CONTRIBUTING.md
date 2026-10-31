@@ -4,11 +4,16 @@
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo build --release --workspace
 mdbook build docs
 ```
+
+The workspace enables a stricter Clippy lint set (`clippy.toml` plus
+`[workspace.lints]`). It is warn-only in CI while the existing violations are
+paid down; the baseline measured on 2026-10-31 was 519 warning lines across the
+workspace. New code should not add warnings.
 
 Privileged tests are not run in CI:
 

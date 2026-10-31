@@ -20,3 +20,6 @@ tar = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "0.8"
 zstd = "0.13"
+
+[lints]
+workspace = true

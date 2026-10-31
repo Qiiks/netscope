@@ -50,13 +50,19 @@ CIDRs must parse as IPv4 or IPv6 networks. An invalid CIDR is rejected with exit
 
 ## What the rules match
 
-The generated rules match only sockets in the profile's cgroup:
+The generated rules match sockets in the profile's cgroup and sockets carrying
+the profile's firewall mark:
 
 ```text
 socket cgroupv2 level 2 "netscope/<profile>"
+socket mark 0x4e53
 ```
 
-They do not match by executable name, user, or port. All protocols and ports are covered, including TCP, UDP, QUIC, and ICMP, as long as the packet has a socket in the cgroup:
+The second form covers a socket that existed before a late attach: the daemon
+cannot move that socket into the cgroup, so it marks the socket itself. Both
+rules are repeated for every filter rule. They do not match by executable name,
+user, or port. All protocols and ports are covered, including TCP, UDP, QUIC,
+and ICMP, as long as the packet's socket is in the cgroup or carries the mark:
 
 - **TCP and UDP:** the socket belongs to the process, so the rule applies.
 - **QUIC:** carried over UDP and treated the same way.

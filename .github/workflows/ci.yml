@@ -19,7 +19,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Warn-only while the pre-existing violations are paid down; see the
+        # lint baseline in CONTRIBUTING.
+        run: cargo clippy --workspace --all-targets
       - name: Test
         run: cargo test --workspace
       - name: Build

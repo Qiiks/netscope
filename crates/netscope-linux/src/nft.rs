@@ -51,6 +51,21 @@ impl NftManager {
         )
     }
 
+    /// Selects the profile cgroup and, separately, a socket already carrying
+    /// its mark.
+    ///
+    /// The mark selector covers sockets that predate the cgroup attach: their
+    /// cgroup is fixed at creation, but [`crate::sockets::set_mark`] changes
+    /// the mark on the socket itself. The two expressions are emitted as
+    /// separate rules because nftables does not compose `socket cgroupv2`
+    /// with `socket mark` under `or`.
+    pub fn profile_selectors(&self, profile: &Profile) -> [String; 2] {
+        [
+            self.cgroup_selector(&profile.id),
+            format!("socket mark 0x{:x}", profile.mark),
+        ]
+    }
+
     pub fn table_name(profile: &Profile) -> String {
         crate::types::table_name(&profile.mode, &profile.id)
     }
@@ -69,8 +84,8 @@ impl NftManager {
 
     pub fn apply(&self, profile: &Profile) -> Result<(), NftError> {
         let name = Self::table_name(profile);
-        let selector = self.cgroup_selector(&profile.id);
-        let body = self.render_body(profile, &selector)?;
+        let selectors = self.profile_selectors(profile);
+        let body = Self::render_body(profile, &selectors)?;
         let script = if self.exists(profile)? {
             format!("flush table inet {name}\ntable inet {name} {{\n{body}}}\n")
         } else {
@@ -89,36 +104,29 @@ impl NftManager {
         Ok(())
     }
 
-    fn render_body(&self, profile: &Profile, selector: &str) -> Result<String, NftError> {
+    fn render_body(profile: &Profile, selectors: &[String]) -> Result<String, NftError> {
         match &profile.mode {
             Mode::Filter {
                 default,
                 exceptions,
             } => {
-                let mut lines = Vec::new();
+                let mut rules = Vec::new();
                 match default {
                     FilterDefault::Drop => {
-                        lines.push(format!(
-                            "    {selector} meta nfproto ipv4 ip daddr 127.0.0.0/8 accept"
-                        ));
-                        lines.push(format!(
-                            "    {selector} meta nfproto ipv6 ip6 daddr ::1/128 accept"
-                        ));
+                        rules.push("meta nfproto ipv4 ip daddr 127.0.0.0/8 accept".to_string());
+                        rules.push("meta nfproto ipv6 ip6 daddr ::1/128 accept".to_string());
                         for exception in exceptions {
-                            lines.push(format!("    {selector} {}", render_address(exception)?));
+                            rules.push(format!("{} accept", render_address(exception)?));
                         }
-                        lines.push(format!("    {selector} counter drop"));
+                        rules.push("counter drop".to_string());
                     }
                     FilterDefault::Allow => {
                         for exception in exceptions {
-                            lines.push(format!(
-                                "    {selector} {} counter drop",
-                                render_address(exception)?
-                            ));
+                            rules.push(format!("{} counter drop", render_address(exception)?));
                         }
                     }
                 }
-                Ok(chain("filter", "filter", &lines))
+                Ok(chain("filter", "filter", &expand(selectors, &rules)))
             }
             Mode::Route {
                 interface: _,
@@ -127,29 +135,36 @@ impl NftManager {
                 include_lan,
                 allow_ipv6,
             } => {
-                let mut lines = vec![
-                    format!("    {selector} meta nfproto ipv4 ip daddr 127.0.0.0/8 accept"),
-                    format!("    {selector} meta nfproto ipv6 ip6 daddr ::1/128 accept"),
+                let mut rules = vec![
+                    "meta nfproto ipv4 ip daddr 127.0.0.0/8 accept".to_string(),
+                    "meta nfproto ipv6 ip6 daddr ::1/128 accept".to_string(),
                 ];
                 if !include_lan {
-                    lines.push(format!(
-                        "    {selector} meta nfproto ipv4 ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 }} accept"
-                    ));
-                    lines.push(format!(
-                        "    {selector} meta nfproto ipv6 ip6 daddr {{ fc00::/7, fe80::/10, ff00::/8 }} accept"
-                    ));
+                    rules.push("meta nfproto ipv4 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 } accept".to_string());
+                    rules.push(
+                        "meta nfproto ipv6 ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } accept"
+                            .to_string(),
+                    );
                 }
                 if !allow_ipv6 {
-                    lines.push(format!("    {selector} meta nfproto ipv6 counter drop"));
+                    rules.push("meta nfproto ipv6 counter drop".to_string());
                 }
-                lines.push(format!(
-                    "    {selector} counter meta mark set 0x{:x}",
-                    profile.mark
-                ));
-                Ok(chain("route", "mangle", &lines))
+                rules.push(format!("counter meta mark set 0x{:x}", profile.mark));
+                Ok(chain("route", "mangle", &expand(selectors, &rules)))
             }
         }
     }
+}
+
+fn expand(selectors: &[String], rules: &[String]) -> Vec<String> {
+    selectors
+        .iter()
+        .flat_map(|selector| {
+            rules
+                .iter()
+                .map(move |rule| format!("    {selector} {rule}"))
+        })
+        .collect()
 }
 
 fn chain(hook: &str, priority: &str, lines: &[String]) -> String {
@@ -205,6 +220,16 @@ mod tests {
         assert_eq!(
             manager.cgroup_selector("game"),
             "socket cgroupv2 level 2 \"netscope/game\""
+        );
+    }
+
+    #[test]
+    fn rules_expand_for_cgroup_and_mark() {
+        let selectors = vec!["cgroup".to_string(), "mark".to_string()];
+        let rules = vec!["counter drop".to_string()];
+        assert_eq!(
+            expand(&selectors, &rules),
+            vec!["    cgroup counter drop", "    mark counter drop"]
         );
     }
 

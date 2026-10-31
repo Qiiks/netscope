@@ -5,6 +5,7 @@ pub mod ip;
 pub mod nft;
 pub mod proc;
 pub mod protocol;
+pub mod sockets;
 pub mod types;
 pub mod watcher;
 

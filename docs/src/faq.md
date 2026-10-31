@@ -28,11 +28,11 @@ Yes. `--process <name>` attaches a running process by its `comm` or an argv base
 sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 ```
 
-Matching is case-insensitive and a trailing `.exe` is optional. This is a late attach: the process is moved into the profile cgroup on the next poll, and sockets opened before the move keep their original route. Use `--exe` or `--wine` when you need the first socket covered.
+Matching is case-insensitive and a trailing `.exe` is optional. This is a late attach: the process is moved into the profile cgroup on the next poll. Sockets it already held are marked with the profile mark at the same time, so their next packets follow the profile too; a restart is not required. Use `--exe` or `--wine` when the very first packet must be caught before the poll.
 
 ## What about applications that are already running?
 
-They are attached late by the poller, if they match. Sockets that were opened before the attach keep their original cgroup and are **not** affected. Restart the application for full coverage. The CLI warns you when it attaches to an already-running app.
+They are attached late by the poller, if they match. Sockets that were opened before the attach are marked with the profile mark, so their next packets follow the profile. The CLI warns you when it attaches to an already-running app and says the sockets were marked. Restart only if the daemon reports that a descriptor could not be marked.
 
 ## Does netscope affect the whole system?
 
@@ -58,7 +58,7 @@ Profiles are stored in `/var/lib/netscope/state.json`, so definitions survive a 
 sudo systemctl enable netscoped
 ```
 
-An application that starts before the daemon is attached late, and its early sockets are not covered. Start the daemon early, or restart the app after the daemon is up.
+An application that starts before the daemon is attached late; its existing sockets are marked when it attaches. Start the daemon early if you need the pre-exec path, or restart the app if the daemon reports a mark failure.
 
 ## Can I edit a profile?
 
@@ -94,9 +94,9 @@ Yes, with `--wine <path>` pointing at the `.exe`. The path must be absolute, and
 
 Only a Wine process running the selected PE is attached. Another program that opens the same `.exe` — a file manager, a scanner, a copy — is allowed and left unscoped. `wineserver` is never attached: it may open the PE on behalf of a loader, but it is a shared server, not the game.
 
-If fanotify cannot be used, the fallback matches Wine processes by command line, including `Z:\...` paths and the `C:\...`/`/drive_c/` form, and attaches late. Sockets opened during startup can then escape, so restart the game after the profile attaches.
+If fanotify cannot be used, the fallback matches Wine processes by command line, including `Z:\...` paths and the `C:\...`/`/drive_c/` form, and attaches late. Sockets opened during startup are marked at attach, so their next packets follow the profile; restart only if the daemon reports a mark failure.
 
-For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. If you do not want to store a path, `--process Overwatch.exe` attaches the running game by name, at the cost of late attachment. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
+For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. If you do not want to store a path, `--process Overwatch.exe` attaches the running game by name on the next poll; sockets it already held are marked. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
 
 ## Is it a firewall?
 

@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use netscope_linux::protocol::{
     AddProfile, ProfileStatus, Request, RequestOp, Response, StatusData,
 };
+use netscope_linux::sockets;
 use netscope_linux::types::{FilterDefault, ModeSpec, TargetSpec};
 use serde_json::Value;
 
@@ -1049,6 +1050,116 @@ fn route_mark_table_blackhole() {
         !nft_tables().contains(&table),
         "nft table {table} survived remove"
     );
+}
+
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn late_socket_mark_routes_existing_socket() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    preflight();
+    let mut daemon = Daemon::new_with_poll("late-sock", 100);
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let (send_bin, recv_bin) = build_fixture(&daemon.temp);
+    let ns = format!("nslate{pid}");
+    let _peer_ip = setup_veth(&ns, &mut daemon);
+    let suffix = pid % 10000;
+    let host = format!("nsv0{suffix}");
+    let peer = format!("nsv1{suffix}");
+    let octet = pid % 250;
+    let target_ip = format!("10.202.{octet}.2");
+    run_ip(&[
+        "netns",
+        "exec",
+        &ns,
+        "ip",
+        "addr",
+        "add",
+        &format!("{target_ip}/24"),
+        "dev",
+        &peer,
+    ]);
+    let port = 41000 + (pid % 20000) as u16;
+    let receiver = spawn_receiver(&ns, &recv_bin, port);
+    daemon.track_pid(receiver.id());
+    thread::sleep(Duration::from_millis(300));
+
+    let sender = daemon.temp.join("late-sock");
+    fs::copy(&send_bin, &sender).expect("copy late sender");
+    fs::set_permissions(&sender, fs::Permissions::from_mode(0o755)).expect("chmod late sender");
+    let dst = format!("{target_ip}:{port}");
+    let mut child = Command::new(&sender)
+        .args(["send-open", &dst])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn late sender");
+    let child_pid = child.id();
+    daemon.track_pid(child_pid);
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("late sender stdout"))
+        .read_line(&mut ready)
+        .expect("read late sender ready");
+    assert_eq!(ready.trim(), "ready", "late sender did not open its socket");
+
+    let id = format!("late-{pid}");
+    let added = client.add(
+        &id,
+        TargetSpec::Name {
+            name: "late-sock".to_string(),
+        },
+        ModeSpec::Route {
+            interface: host,
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+        },
+        0,
+    );
+    daemon.track_profile(&id, &added);
+    wait_for_cgroup(&daemon, &id, child_pid, Duration::from_secs(2));
+    let mark = parse_mark(&added.mark).expect("late profile mark");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let marks = sockets::marks(child_pid).expect("read late sender marks");
+        if marks.iter().any(|(_, current)| *current == mark) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pre-opened socket on pid {child_pid} did not carry mark 0x{mark:x}: {marks:?}\n{}",
+            daemon.log_tail()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    child
+        .stdin
+        .take()
+        .expect("late sender stdin")
+        .write_all(b"x")
+        .expect("gate late sender");
+    let output = child.wait_with_output().expect("wait for late sender");
+    assert!(
+        output.status.success(),
+        "late sender failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        receiver_count(receiver, &daemon),
+        1,
+        "pre-opened socket was not routed through the marked table\n{}",
+        daemon.log_tail()
+    );
+    client.remove(&id);
+    let _ = fs::remove_file(&sender);
 }
 
 #[test]

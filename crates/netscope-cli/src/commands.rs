@@ -302,7 +302,7 @@ pub fn add(socket: &Path, profile: AddProfile) -> i32 {
             println!("added {name}");
             let added = data.and_then(|value| serde_json::from_value::<ProfileStatus>(value).ok());
             if added.is_some_and(|status| !status.pids.is_empty()) {
-                println!("existing connections unaffected; restart the app for full coverage");
+                println!("existing sockets marked; restart is not required");
             }
             0
         }

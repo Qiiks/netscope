@@ -72,7 +72,7 @@ sudo netscope --uid "$(id -u)" add browser --exe /usr/bin/firefox --filter allow
 firefox
 ```
 
-Start `firefox` normally, from the desktop or a shell. The daemon catches the `exec`, places the process in the `netscope/browser` cgroup before its first socket, and nftables matches the cgroup. In this example the browser keeps internet access but cannot reach the `192.168.0.0/16` LAN. If the app is already running when you add the profile, restart it for full coverage.
+Start `firefox` normally, from the desktop or a shell. The daemon catches the `exec`, places the process in the `netscope/browser` cgroup before its first socket, and nftables matches the cgroup. In this example the browser keeps internet access but cannot reach the `192.168.0.0/16` LAN. If the app is already running when you add the profile, it is attached on the next poll and its existing sockets are marked.
 
 ## 6. Route instead of filter
 
@@ -112,7 +112,7 @@ If the app is already running, or you do not want to store its install path, use
 sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 ```
 
-No path and no wrapper are involved. The daemon matches the process `comm` or an argv basename, case-insensitively, and attaches it on the next poll. `netscope status` shows `name:Overwatch.exe` and `late`. Sockets opened before the attach keep their original route, so restart the app if you need every socket covered.
+No path and no wrapper are involved. The daemon matches the process `comm` or an argv basename, case-insensitively, and attaches it on the next poll. `netscope status` shows `name:Overwatch.exe` and `late`. Sockets opened before the attach are marked at that moment, so their next packets follow the profile without a restart.
 
 ## 9. Run diagnostics
 

@@ -5,14 +5,15 @@
 //! for one byte on stdin so the test can attach the process before it emits
 //! its probe; `recv` counts packets until the read timeout expires.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("send") => send(args.get(2).expect("destination")),
+        Some("send") => send(args.get(2).expect("destination"), false),
+        Some("send-open") => send(args.get(2).expect("destination"), true),
         Some("recv") => recv(args.get(2).expect("port")),
         Some("open-sleep") => open_sleep(args.get(2).expect("pe path")),
         _ => std::process::exit(2),
@@ -25,12 +26,23 @@ fn open_sleep(path: &str) {
     std::thread::sleep(Duration::from_secs(30));
 }
 
-fn send(dst: &str) {
+fn send(dst: &str, open_first: bool) {
+    let socket = if open_first {
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind sender");
+        println!("ready");
+        std::io::stdout().flush().expect("flush ready");
+        Some(socket)
+    } else {
+        None
+    };
     let mut gate = [0u8; 1];
     if std::io::stdin().read_exact(&mut gate).is_err() {
         std::process::exit(3);
     }
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("bind sender");
+    let socket = match socket {
+        Some(socket) => socket,
+        None => UdpSocket::bind("0.0.0.0:0").expect("bind sender"),
+    };
     // A scoped filter profile rejects the send with EPERM; that is the drop.
     match socket.send_to(b"netscope-probe", dst) {
         Ok(_) => {}

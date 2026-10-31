@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
@@ -19,6 +19,7 @@ use netscope_linux::protocol::{
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 use netscope_linux::run;
+use netscope_linux::sockets::{self, SocketMarkError};
 use netscope_linux::types::{
     mark, profile_id_valid, rule_priority, table, table_name, Config, FilterDefault, Mode,
     ModeSpec, Profile, ProfileId, State, Target, TargetSpec, MAX_PROFILES,
@@ -63,6 +64,7 @@ struct Rt {
 struct Inner {
     state: State,
     provenance: HashMap<u32, AttachSource>,
+    marked: HashSet<u32>,
     health: HashMap<String, bool>,
 }
 
@@ -126,6 +128,7 @@ async fn async_main() -> Result<(), String> {
         inner: Mutex::new(Inner {
             state: State::default(),
             provenance: HashMap::new(),
+            marked: HashSet::new(),
             health: HashMap::new(),
         }),
         shutting_down: AtomicBool::new(false),
@@ -604,8 +607,10 @@ fn reconcile_disabled(rt: &Rt, inner: &mut Inner, profile: &Profile) -> Result<b
     rt.cgroup
         .drain(&profile.id)
         .map_err(|err| err.to_string())?;
-    for pid in pids {
-        inner.provenance.remove(&pid);
+    clear_socket_marks(&profile.id, profile.mark, &pids);
+    for pid in &pids {
+        inner.provenance.remove(pid);
+        inner.marked.remove(pid);
     }
     Ok(true)
 }
@@ -789,23 +794,58 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
     if !profile.enabled {
         return;
     }
-    if rt
-        .cgroup
-        .procs(id)
-        .map(|pids| pids.contains(&pid))
-        .unwrap_or(false)
-    {
+    let mark = profile.mark;
+    let already_attached = rt.cgroup.procs(id).is_ok_and(|pids| pids.contains(&pid));
+    if already_attached {
+        if matches!(
+            inner.provenance.get(&pid),
+            Some(AttachSource::PreExec | AttachSource::PreOpen)
+        ) {
+            return;
+        }
+        if !inner.marked.contains(&pid) && mark_sockets(id, mark, pid) {
+            inner.marked.insert(pid);
+        }
         return;
     }
     match rt.cgroup.attach_tree(pid, id, source) {
         Ok(attached) => {
             for tgid in attached {
+                if !inner.marked.contains(&tgid) && mark_sockets(id, mark, tgid) {
+                    inner.marked.insert(tgid);
+                }
                 inner.provenance.insert(tgid, source);
             }
             info!("attach profile={id} pid={pid} source=poll");
         }
         Err(CgroupError::ProcessGone(_)) => {}
         Err(err) => warn!("attach profile={id} pid={pid} error={err}"),
+    }
+}
+
+fn mark_sockets(id: &str, mark: u32, pid: u32) -> bool {
+    match sockets::set_mark(pid, mark) {
+        Ok(count) => {
+            if count > 0 {
+                info!("marked profile={id} pid={pid} sockets={count}");
+            }
+            true
+        }
+        Err(SocketMarkError::ProcessGone(_)) => true,
+        Err(err) => {
+            warn!("mark profile={id} pid={pid} error={err}");
+            false
+        }
+    }
+}
+
+fn clear_socket_marks(id: &str, mark: u32, pids: &[u32]) {
+    for pid in pids {
+        if let Err(err) = sockets::clear_mark(*pid, mark) {
+            if !matches!(err, SocketMarkError::ProcessGone(_)) {
+                warn!("clear profile={id} pid={pid} error={err}");
+            }
+        }
     }
 }
 
@@ -942,6 +982,7 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
         live.extend(rt.cgroup.procs(&profile.id).unwrap_or_default());
     }
     inner.provenance.retain(|pid, _| live.contains(pid));
+    inner.marked.retain(|pid| live.contains(pid));
 }
 
 async fn poll_task(rt: Arc<Rt>, period: Duration) {
@@ -1377,9 +1418,7 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         }
     }
     if matches!(&profile.target, Target::Name { .. }) {
-        warnings.push(
-            "name target attaches late; sockets opened before attach are unaffected".to_string(),
-        );
+        warnings.push("name target attaches late; existing sockets are marked".to_string());
     }
     ProfileStatus {
         id: profile.id.clone(),
@@ -1564,11 +1603,13 @@ async fn remove_profile(rt: &Arc<Rt>, peer_uid: u32, id: &str) -> Result<(), Str
         }
     }
     let pids = rt.cgroup.procs(id).unwrap_or_default();
+    clear_socket_marks(id, profile.mark, &pids);
     if let Err(err) = rt.cgroup.remove(id) {
         warn!("remove profile={id} cgroup error={err}");
     }
     for pid in pids {
         inner.provenance.remove(&pid);
+        inner.marked.remove(&pid);
     }
     inner.state.profiles.remove(id);
     inner.health.remove(id);
@@ -1632,9 +1673,11 @@ async fn set_enabled(
         if let Err(err) = rt.cgroup.drain(id) {
             warn!("disable profile={id} drain error={err}");
         }
-        for pid in pids {
-            inner.provenance.remove(&pid);
+        for pid in &pids {
+            inner.provenance.remove(pid);
+            inner.marked.remove(pid);
         }
+        clear_socket_marks(id, profile.mark, &pids);
         if let Some(stored) = inner.state.profiles.get_mut(id) {
             stored.enabled = false;
             stored.updated_at = now_rfc3339();

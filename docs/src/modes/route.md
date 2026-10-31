@@ -99,7 +99,13 @@ Queries sent to a local stub resolver are delivered over loopback and are theref
 
 ## Existing connections
 
-A TCP connection that was established before the process was attached keeps its original route. It is not re-routed. Restart the application after adding the profile so every connection is marked.
+A socket that existed before the process was attached is marked with the
+profile's firewall mark. Changing `SO_MARK` resets the kernel's cached
+destination, so packets sent after the attach use the profile's routing table.
+The connection is not re-established: TCP state, sequence numbers, and the
+peer stay as they were, and only the path changes. If a descriptor could not be
+marked, the daemon logs `mark profile=... error=...`; restart the application
+to cover that socket.
 
 ## Inspect the routing state
 

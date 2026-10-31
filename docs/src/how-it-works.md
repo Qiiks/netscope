@@ -6,7 +6,7 @@ netscope gives one application a cgroup identity and writes nftables rules that 
 
 1. **Add a profile.** The CLI canonicalizes `--exe` and sends its path to the daemon. The daemon resolves the path to a device and inode and stores that identity with the profile. A `--wine` profile does the same for a Windows PE, after checking that the file starts with `MZ`. A `--process` profile stores only the process name. A Steam profile stores the app ID instead.
 2. **Catch the next exec or open.** `fanotify` watches for `exec` of the selected native inode, or for the first open of the selected PE by a Wine/Proton loader. The kernel holds the operation until the daemon answers, which gives the daemon time to create `/sys/fs/cgroup/netscope/<profile>` and move the new process into it. Name targets have no inode to mark, so the poll attaches them by scanning `/proc`.
-3. **Match on the cgroup.** nftables rules use `socket cgroupv2`, not a process name, PID, or executable string. A process cannot escape the match by renaming itself or by being re-parented.
+3. **Match on the cgroup or the profile mark.** nftables rules use `socket cgroupv2` for processes moved before their first socket. A process attached after it already held sockets has those sockets marked with the profile's firewall mark, and a second `socket mark` rule matches them. A process cannot escape the cgroup match by renaming itself or by being re-parented.
 4. **Filter or mark.** A filter profile accepts or drops matching packets. A route profile sets a firewall mark on them.
 5. **Route by mark.** For route profiles, an `ip rule` sends marked packets to a dedicated routing table containing the tunnel route and a higher-metric blackhole default.
 
@@ -68,23 +68,39 @@ want to store. It is the only target kind that needs no file identity:
   `status` reports the target as `name:<name>` and the attach source as `late`.
 - A process already running is attached on the next poll. A process started
   later is attached within one poll interval.
+- Sockets that the process already held are marked with the profile's firewall
+  mark as part of the attach, so their next packets follow the profile too.
+  The mark is also what the nftables rules match for those sockets.
 
-The gap is the same as every late attachment: a socket opened before the move
-keeps its original cgroup, so it is not matched by the profile. Use `--exe` or
-`--wine` when you need the socket covered from its first packet. Name targets
-also cannot distinguish two processes with the same name; both are attached.
+Name targets cannot distinguish two processes with the same name; both are
+attached.
 
 ## Late attachment (poll fallback)
 
 If fanotify cannot be used — for example because the kernel or a security policy refuses the permission group — the daemon scans `/proc` on an interval (`poll_interval_ms`, default 1000 ms). It attaches matching processes and their children after the fact. For a native target it matches the executable path. For a Wine target it requires a Wine process and matches the configured PE path against the process command line, accepting a Windows-style `Z:\...` path and the `C:\...` form that maps under `/drive_c/`. Name targets always use this path.
 
-Late attachment has an unavoidable gap: a socket opened before the process was moved keeps its original cgroup, so it is not matched by the profile's rules. This also applies to Wine targets, where the loader may open sockets while starting the game. The daemon reports the profile as `late` and the CLI prints a warning when it attaches to an already-running app:
+Late attachment covers sockets that already exist. After moving the process
+into its cgroup, the daemon walks `/proc/<pid>/fd`, duplicates each descriptor
+with `pidfd_getfd`, and sets `SO_MARK` to the profile's mark on every IPv4 and
+IPv6 socket it finds. Changing the mark resets the kernel's cached destination,
+so the next packet is routed through the profile's table. The nftables chain
+matches those sockets with `socket mark` in addition to `socket cgroupv2`.
+
+This needs `CAP_NET_ADMIN` and the ability to inspect the target process, which
+the root daemon has. If a descriptor cannot be reached, the attach is reported
+with a `mark profile=... error=...` log line and that socket keeps its original
+route. A daemon restart marks existing sockets again on the next poll.
+
+The daemon reports a late attach through `status`, and the CLI prints a
+warning when the target was already running:
 
 ```text
-existing connections unaffected; restart the app for full coverage
+existing sockets marked; restart is not required
 ```
 
-Restarting the application closes that gap. Existing sockets are never retroactively moved.
+Removing a profile clears the mark from sockets that still carry it, so a
+later profile reusing the same mark cannot inherit them. A daemon restart keeps
+the marks that are already set and re-marks the target on the next poll.
 
 ## Background loops
 
@@ -107,7 +123,8 @@ A filter profile's table hooks `output` in the `inet` family. Rules are evaluate
 - **`--filter drop`:** accept IPv4 `127.0.0.0/8` and IPv6 `::1/128`, accept each `--allow-cidr`, then drop everything else.
 - **`--filter allow`:** drop each `--deny-cidr`; the chain policy accepts everything else. At least one deny CIDR is required, otherwise the profile would do nothing.
 
-Only packets with a socket in the profile's cgroup are matched. See [Filter mode](modes/filter.md).
+Only packets with a socket in the profile's cgroup or carrying the profile's
+mark are matched. See [Filter mode](modes/filter.md).
 
 ## Route evaluation
 
@@ -123,7 +140,7 @@ When the interface is up, the real route wins. When it is down, the blackhole ma
 - No kernel module and no eBPF program. Everything is cgroup v2, fanotify, nftables, and policy routing.
 - No packet capture, no DNS rewriting, no proxy, no remote API, and no web UI.
 - No system-wide mode: netscope scopes selected applications, not the whole machine.
-- No coverage for traffic forwarded on behalf of another host, kernel-generated packets without a local socket, or sockets opened before attachment.
+- No coverage for traffic forwarded on behalf of another host, kernel-generated packets without a local socket, or sockets that cannot be inspected by the root daemon.
 
 ## Next
 
