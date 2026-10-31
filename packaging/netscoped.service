@@ -13,14 +13,16 @@ TimeoutStopSec=30
 User=root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=RUST_LOG=info
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
 AmbientCapabilities=
 NoNewPrivileges=yes
-ProtectSystem=strict
+# Needs write access to the cgroup tree and /sys/fs/cgroup remounts.
+ProtectSystem=no
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectControlGroups=no
-ProtectKernelTunables=yes
+# The cgroup tree is a kernel interface this daemon must create and write.
+ProtectKernelTunables=no
 # nft_socket may autoload on the first cgroupv2 rule; blocking module load breaks filter/route setup.
 ProtectKernelModules=no
 ProtectClock=yes
@@ -36,7 +38,7 @@ RuntimeDirectory=netscope
 RuntimeDirectoryMode=0755
 StateDirectory=netscope
 StateDirectoryMode=0750
-ReadWritePaths=-/sys/fs/cgroup/netscope /var/lib/netscope /run/netscope
+ReadWritePaths=-/sys/fs/cgroup /var/lib/netscope /run/netscope
 
 [Install]
 WantedBy=multi-user.target

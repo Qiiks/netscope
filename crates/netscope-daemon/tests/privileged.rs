@@ -1138,6 +1138,14 @@ fn shared_scope_composes_filter_and_route_for_two_consumers() {
     assert_eq!(route.policies.len(), 2);
     assert_eq!(route.mode, "route");
     let table = table_name_from_status(&route);
+    let mark = parse_mark(&route.mark).expect("route mark");
+    let rules = run_cmd("ip", &["-4", "rule", "show"]);
+    assert!(
+        rules.contains(&format!("fwmark 0x{mark:x}"))
+            && rules.contains("to 127.0.0.0/8")
+            && rules.contains("lookup main"),
+        "loopback exception missing from rules: {rules}"
+    );
     let body = run_cmd("nft", &["list", "table", "inet", table.as_str()]);
     let drop_at = body.find("drop").expect("filter rule");
     let mark_at = body.find("meta mark set").expect("route rule");
@@ -1162,6 +1170,173 @@ fn shared_scope_composes_filter_and_route_for_two_consumers() {
     assert!(released.removed);
     assert!(!nft_tables().contains(&table), "table survived last close");
     assert!(!daemon.cgroup_root.join(&id).exists(), "cgroup survived");
+}
+
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn shared_scope_routes_fake_game_and_drops_after_policy_change() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    preflight();
+    let mut daemon = Daemon::new_with_poll("fake-game", 100);
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let (send_bin, recv_bin) = build_fixture(&daemon.temp);
+    let ns = format!("nsfake{pid}");
+    let _peer_ip = setup_veth(&ns, &mut daemon);
+    let suffix = pid % 10000;
+    let host = format!("nsv0{suffix}");
+    let peer = format!("nsv1{suffix}");
+    let octet = pid % 200;
+    let target_ip = format!("10.203.{octet}.2");
+    run_ip(&[
+        "netns",
+        "exec",
+        &ns,
+        "ip",
+        "addr",
+        "add",
+        &format!("{target_ip}/24"),
+        "dev",
+        &peer,
+    ]);
+    let port = 42000 + (pid % 15000) as u16;
+    let first_receiver = spawn_receiver(&ns, &recv_bin, port);
+    daemon.track_pid(first_receiver.id());
+    let second_receiver = spawn_receiver(&ns, &recv_bin, port + 1);
+    daemon.track_pid(second_receiver.id());
+    thread::sleep(Duration::from_millis(300));
+
+    let game = daemon.temp.join("fake-game.exe");
+    fs::copy(&send_bin, &game).expect("copy fake game");
+    fs::set_permissions(&game, fs::Permissions::from_mode(0o755)).expect("chmod fake game");
+    let dst = format!("{target_ip}:{port}");
+    let dropped_dst = format!("{target_ip}:{}", port + 1);
+
+    let mut first = Command::new(&game)
+        .args(["send-open", &dst])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn first fake game");
+    daemon.track_pid(first.id());
+    let mut ready = String::new();
+    BufReader::new(first.stdout.take().expect("first stdout"))
+        .read_line(&mut ready)
+        .expect("read first ready");
+    assert_eq!(ready.trim(), "ready", "fake game did not open its socket");
+
+    let id = format!("fake-{pid}");
+    let target = TargetSpec::Name {
+        name: "fake-game.exe".to_string(),
+    };
+    client.open(OpenScope {
+        consumer: "dropship".to_string(),
+        target: target.clone(),
+        target_uid: 0,
+        name: Some(id.clone()),
+        hold: Hold::Persistent,
+    });
+    client.set_policy(
+        &id,
+        "dropship",
+        PolicySpec::Filter {
+            default: FilterDefault::Drop,
+            allow_cidrs: vec![format!("{target_ip}/32")],
+            deny_cidrs: Vec::new(),
+        },
+    );
+    client.open(OpenScope {
+        consumer: "exitlink".to_string(),
+        target,
+        target_uid: 0,
+        name: None,
+        hold: Hold::Peer,
+    });
+    let route = client.set_policy(
+        &id,
+        "exitlink",
+        PolicySpec::Route {
+            interface: host,
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+            except: Vec::new(),
+        },
+    );
+    daemon.track_profile(&id, &route);
+    wait_for_cgroup(&daemon, &id, first.id(), Duration::from_secs(2));
+
+    first
+        .stdin
+        .take()
+        .expect("first stdin")
+        .write_all(b"x")
+        .expect("gate first");
+    let output = first.wait_with_output().expect("wait first");
+    assert!(
+        output.status.success(),
+        "first fake game failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    thread::sleep(Duration::from_millis(200));
+
+    // Same process identity, now dropped: the packet must not reach the
+    // receiver even though the route policy is still installed.
+    client.set_policy(
+        &id,
+        "dropship",
+        PolicySpec::Filter {
+            default: FilterDefault::Drop,
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+        },
+    );
+    let mut second = Command::new(&game)
+        .args(["send-open", &dropped_dst])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn second fake game");
+    daemon.track_pid(second.id());
+    let mut ready = String::new();
+    BufReader::new(second.stdout.take().expect("second stdout"))
+        .read_line(&mut ready)
+        .expect("read second ready");
+    assert_eq!(ready.trim(), "ready", "second fake game did not open");
+    wait_for_cgroup(&daemon, &id, second.id(), Duration::from_secs(2));
+    second
+        .stdin
+        .take()
+        .expect("second stdin")
+        .write_all(b"x")
+        .expect("gate second");
+    let output = second.wait_with_output().expect("wait second");
+    assert!(output.status.success(), "second fake game failed");
+    thread::sleep(Duration::from_millis(200));
+    let allowed = receiver_count(first_receiver, &daemon);
+    let dropped = receiver_count(second_receiver, &daemon);
+    assert_eq!(
+        allowed,
+        1,
+        "allowed packet did not route through the shared scope\n{}",
+        daemon.log_tail()
+    );
+    assert_eq!(
+        dropped,
+        0,
+        "drop policy leaked a packet through the shared route\n{}",
+        daemon.log_tail()
+    );
+
+    client.close(&id, "dropship");
+    let released = client.close(&id, "exitlink");
+    assert!(released.removed);
 }
 
 #[test]
@@ -1224,7 +1399,7 @@ fn late_socket_mark_routes_existing_socket() {
             name: "late-sock".to_string(),
         },
         ModeSpec::Route {
-            interface: host,
+            interface: host.clone(),
             gateway: None,
             gateway6: None,
             include_lan: false,
@@ -1251,6 +1426,31 @@ fn late_socket_mark_routes_existing_socket() {
         thread::sleep(Duration::from_millis(20));
     }
 
+    // A second profile's removal must not clear the first profile's marks.
+    let other = client.add(
+        &format!("other-{pid}"),
+        TargetSpec::Name {
+            name: "other-late".to_string(),
+        },
+        ModeSpec::Route {
+            interface: host,
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+            except: Vec::new(),
+        },
+        0,
+    );
+    daemon.track_profile(&format!("other-{pid}"), &other);
+    client.remove(&format!("other-{pid}"));
+    let marks = sockets::marks(child_pid).expect("read marks after other remove");
+    assert!(
+        marks.iter().any(|(_, current)| *current == mark),
+        "unrelated profile removal cleared mark 0x{mark:x}: {marks:?}\n{}",
+        daemon.log_tail()
+    );
+
     child
         .stdin
         .take()
@@ -1271,6 +1471,7 @@ fn late_socket_mark_routes_existing_socket() {
         "pre-opened socket was not routed through the marked table\n{}",
         daemon.log_tail()
     );
+
     client.remove(&id);
     let _ = fs::remove_file(&sender);
 }
