@@ -1,0 +1,89 @@
+name: Feature request
+description: Propose a capability or behavior change for netscope
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        netscope keeps a deliberately small scope: per-application filtering and routing
+        on Linux with cgroups, nftables, and policy routing. Read the
+        [FAQ](https://qiiks.github.io/netscope/faq.html) before proposing a large change.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that netscope makes difficult or impossible today?
+      placeholder: I need to route a game's launcher and its child process through different interfaces.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should netscope do? Be concrete about commands, flags, or behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other tools that solve this.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Filter mode
+        - Route mode
+        - CLI
+        - Daemon or protocol
+        - Documentation
+        - Packaging
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected behavior
+      description: How should a user see this work? Include an example command and result if possible.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Scope checks
+      description: The following are fixed constraints for v0.1.x.
+      options:
+        - label: This does not require a wrapper, `LD_PRELOAD`, or proxy auto-configuration.
+        - label: This does not require a kernel module or an eBPF program.
+        - label: This does not add telemetry, remote analytics, or a network listener.
+
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Willing to contribute?
+      options:
+        - "Yes, I can open a pull request"
+        - "Yes, with guidance"
+        - "No, I am only suggesting"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, prior art, or edge cases.
+    validations:
+      required: false

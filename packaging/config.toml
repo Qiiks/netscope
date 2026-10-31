@@ -1,0 +1,8 @@
+[daemon]
+socket_path = "/run/netscope/control.sock"
+state_path = "/var/lib/netscope/state.json"
+cgroup_root = "/sys/fs/cgroup/netscope"
+poll_interval_ms = 1000
+refresh_interval_secs = 5
+max_profiles = 32
+log_level = "info"

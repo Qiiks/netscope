@@ -1,0 +1,154 @@
+name: Bug report
+description: Report a reproducible netscope problem
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please search existing issues and read the
+        [troubleshooting guide](https://qiiks.github.io/netscope/troubleshooting.html) first.
+
+        For a security vulnerability, do **not** open a public issue. Use the
+        [private advisory form](https://github.com/Qiiks/netscope/security/advisories/new).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear, specific description of the problem.
+      placeholder: Traffic from the selected app still left through the default route after the tunnel dropped.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands and actions, in order. Include the full netscope command.
+      placeholder: |
+        1. sudo netscope --uid 1000 add routed --exe /usr/bin/curl --route tun0
+        2. curl https://example.com
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include error text and exit codes verbatim.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: netscope version
+      description: Output of `netscope --version`.
+      placeholder: netscope 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation channel
+      options:
+        - AUR netscope-bin
+        - Release tarball
+        - cargo install --git
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: Arch Linux, current; or Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`.
+      placeholder: 6.11.0-arch1-1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Profile mode
+      options:
+        - Filter (drop)
+        - Filter (allow)
+        - Route
+        - More than one mode
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cgroup
+    attributes:
+      label: Is cgroup v2 confirmed?
+      description: Output of `stat -fc %T /sys/fs/cgroup` should be `cgroup2fs`.
+      options:
+        - "Yes (cgroup2fs)"
+        - "No"
+        - Not checked
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: Paste `sudo netscope doctor` output. JSON is fine.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Profile status
+      description: Paste `netscope status` while the problem is happening.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: context
+    attributes:
+      label: Context
+      options:
+        - label: The daemon runs under systemd.
+        - label: The application was already running when the profile was added.
+        - label: I restarted the application after adding the profile.
+        - label: I reviewed a support bundle and will attach it to this issue.
+        - label: I searched existing issues for this problem.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Logs, `ip`/`nft` output, or anything else that helps. Review before pasting.
+      render: shell
+    validations:
+      required: false
+

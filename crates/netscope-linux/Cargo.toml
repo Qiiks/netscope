@@ -1,0 +1,17 @@
+[package]
+name = "netscope-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Per-application network scoping primitives for Linux"
+
+[dependencies]
+anyhow = "1"
+ipnet = { version = "2", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"

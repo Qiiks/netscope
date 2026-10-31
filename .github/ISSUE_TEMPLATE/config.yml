@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://qiiks.github.io/netscope/
+    about: Install, quick start, CLI reference, modes, and configuration.
+  - name: Troubleshooting and support
+    url: https://qiiks.github.io/netscope/troubleshooting.html
+    about: Diagnose a problem with doctor, status, and the support bundle before filing an issue.
+  - name: Security vulnerability
+    url: https://github.com/Qiiks/netscope/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

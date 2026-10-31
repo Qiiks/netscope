@@ -1,0 +1,12 @@
+[book]
+title = "netscope"
+authors = ["Qiiks"]
+description = "Per-application network scoping for Linux"
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/netscope/"
+git-repository-url = "https://github.com/Qiiks/netscope"
+edit-url-template = "https://github.com/Qiiks/netscope/edit/main/docs/src/{path}"
+additional-css = ["theme/custom.css"]
