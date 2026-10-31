@@ -1,5 +1,9 @@
 post_install() {
-  echo "add your user to the netscope group: sudo usermod -aG netscope $USER"
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    echo "add $SUDO_USER to the netscope group: sudo usermod -aG netscope $SUDO_USER"
+  else
+    echo "add your user to the netscope group: sudo usermod -aG netscope <your-user>"
+  fi
 }
 
 post_upgrade() {
