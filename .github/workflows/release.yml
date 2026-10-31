@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system tools
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 zstd
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="netscope-v${version}-x86_64-linux"
+          dir="dist/${name}"
+          mkdir -p "$dir"
+          install -Dm755 target/release/netscope "$dir/netscope"
+          install -Dm755 target/release/netscoped "$dir/netscoped"
+          install -Dm644 packaging/netscoped.service "$dir/netscoped.service"
+          install -Dm644 packaging/netscope.sysusers "$dir/netscope.sysusers"
+          install -Dm644 packaging/config.toml "$dir/config.toml"
+          install -Dm755 install.sh "$dir/install.sh"
+          install -Dm755 uninstall.sh "$dir/uninstall.sh"
+          install -Dm644 LICENSE-MIT "$dir/LICENSE-MIT"
+          install -Dm644 LICENSE-APACHE "$dir/LICENSE-APACHE"
+          install -Dm644 README.md "$dir/README.md"
+          tar --zstd -cf "dist/${name}.tar.zst" -C dist "$name"
+          (cd dist && sha256sum "${name}.tar.zst") > dist/SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.zst dist/SHA256SUMS --generate-notes

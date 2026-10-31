@@ -1,0 +1,17 @@
+pkgbase = netscope-bin
+	pkgdesc = Per-application network scoping for Linux
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Qiiks/netscope
+	install = netscope-bin.install
+	arch = x86_64
+	license = MIT
+	license = Apache
+	depends = nftables
+	depends = iproute2
+	depends = systemd
+	backup = etc/netscope/config.toml
+	source = https://github.com/Qiiks/netscope/releases/download/v0.1.0/netscope-v0.1.0-x86_64-linux.tar.zst
+	sha256sums = SKIP
+
+pkgname = netscope-bin

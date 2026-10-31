@@ -1,0 +1,17 @@
+post_install() {
+  echo "add your user to the netscope group: sudo usermod -aG netscope $USER"
+}
+
+post_upgrade() {
+  systemctl try-restart netscoped.service 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl disable --now netscoped.service 2>/dev/null || true
+  /usr/bin/netscope cleanup --all 2>/dev/null || true
+}
+
+post_remove() {
+  systemctl daemon-reload
+  groupdel netscope 2>/dev/null || true
+}

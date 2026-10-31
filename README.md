@@ -14,7 +14,7 @@ sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```
 
-Tarball and `cargo install --git` channels are documented in [docs/install.md](docs/install.md). Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or AUR.
+Tarball and `cargo install --git` channels are documented in [docs/install.md](docs/install.md). Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or AUR. Full documentation: <https://qiiks.github.io/netscope/>.
 
 ## Use
 

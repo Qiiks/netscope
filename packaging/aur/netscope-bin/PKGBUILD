@@ -1,0 +1,23 @@
+pkgname=netscope-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Per-application network scoping for Linux"
+arch=('x86_64')
+url="https://github.com/Qiiks/netscope"
+license=('MIT' 'Apache')
+depends=('nftables' 'iproute2' 'systemd')
+backup=('etc/netscope/config.toml')
+install=netscope-bin.install
+source=("$url/releases/download/v$pkgver/netscope-v$pkgver-x86_64-linux.tar.zst")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/netscope-v$pkgver-x86_64-linux"
+  install -Dm755 netscope "$pkgdir/usr/bin/netscope"
+  install -Dm755 netscoped "$pkgdir/usr/bin/netscoped"
+  install -Dm644 netscoped.service "$pkgdir/usr/lib/systemd/system/netscoped.service"
+  install -Dm644 netscope.sysusers "$pkgdir/usr/lib/sysusers.d/netscope.conf"
+  install -Dm644 config.toml "$pkgdir/etc/netscope/config.toml"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
