@@ -1,6 +1,6 @@
 # Filter mode
 
-Filter mode accepts or drops packets from one application. It does not change routing: accepted traffic follows the machine's normal routes.
+Filter mode accepts or drops packets from one application. On its own it does not change routing: accepted traffic follows the machine's normal routes. A shared profile that also carries a route policy sends accepted traffic through that route.
 
 ```sh
 sudo netscope --uid "$(id -u)" add blocked --exe /usr/bin/curl --filter drop
@@ -15,7 +15,7 @@ sudo netscope --uid "$(id -u)" add blocked --exe /usr/bin/curl --filter drop
 | `drop` | Loopback and `--allow-cidr` destinations are accepted; everything else is dropped. |
 | `allow` | `--deny-cidr` destinations are dropped; everything else is accepted. |
 
-Loopback is always accepted in `drop` mode, for both IPv4 (`127.0.0.0/8`) and IPv6 (`::1/128`). It is not possible to block an application's loopback traffic with a filter profile.
+Loopback is always accepted in `drop` mode, for both IPv4 (`127.0.0.0/8`) and IPv6 (`::1/128`). `allow` mode accepts loopback unless you deny it explicitly with a CIDR.
 
 ## Exceptions
 
@@ -47,6 +47,14 @@ sudo netscope --uid "$(id -u)" add limited \
 `--deny-cidr` is only valid with `--filter allow`. It is invalid with `--filter drop`.
 
 CIDRs must parse as IPv4 or IPv6 networks. An invalid CIDR is rejected with exit code `2` before the profile is created.
+
+## Evaluation order
+
+`--filter drop` emits a negated drop per family: everything except loopback and
+the `--allow-cidr` destinations is dropped, and non-IP traffic is dropped too.
+An accepted packet falls through to any route policy in the same shared
+profile, so a filter never silently replaces a route. `--filter allow` drops
+only the `--deny-cidr` destinations and lets everything else fall through.
 
 ## What the rules match
 
@@ -86,17 +94,22 @@ Host names cannot be used as exceptions. Resolve them first and allow the addres
 
 ## Existing connections
 
-The filter applies to packets, not to an application's lifetime. A connection that was open before the process was attached keeps its own cgroup, so its packets are not matched and it continues to work. Restart the application for full coverage.
+The filter applies to packets, not to an application's lifetime. A socket that was open before a late attach is marked with the profile's firewall mark, so its packets are matched without a restart. If a descriptor cannot be marked, the daemon logs `mark profile=... error=...` and that socket continues on its old path; restart the application to cover it.
 
 ## Changes and removal
 
-- Editing a profile is not supported in v0.2.0. Remove it and add it again with the new mode or exceptions.
+- A consumer's policy can be replaced with `netscope policy`; `netscope add` still creates a one-shot profile owned by `netscope-cli`.
 - `enable` and `disable` keep the profile and its cgroup but stop or resume enforcement.
 - `remove` deletes the nftables table and the cgroup. Traffic is unfiltered immediately.
 
 ## Interaction with route mode
 
-A profile is either a filter profile or a route profile, never both. Adding a second profile for the same executable does not merge them; each profile has its own cgroup, table, and index. Use one profile per application unless you deliberately want two identities.
+A shared profile can carry several filter policies and one route policy, one
+policy per consumer. Filters run first; a packet dropped by any consumer is
+terminal, and an accepted packet continues to the route mark. A second
+filter or route consumer for the same target and target uid joins that profile
+through `netscope open`; a second `netscope add` is refused. See
+[Shared scopes](../shared-scopes.md).
 
 ## Examples
 

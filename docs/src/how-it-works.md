@@ -5,7 +5,7 @@ netscope gives one application a cgroup identity and writes nftables rules that 
 ## The pipeline
 
 1. **Add a profile.** The CLI canonicalizes `--exe` and sends its path to the daemon. The daemon resolves the path to a device and inode and stores that identity with the profile. A `--wine` profile does the same for a Windows PE, after checking that the file starts with `MZ`. A `--process` profile stores only the process name. A Steam profile stores the app ID instead.
-2. **Catch the next exec or open.** `fanotify` watches for `exec` of the selected native inode, or for the first open of the selected PE by a Wine/Proton loader. The kernel holds the operation until the daemon answers, which gives the daemon time to create `/sys/fs/cgroup/netscope/<profile>` and move the new process into it. Name targets have no inode to mark, so the poll attaches them by scanning `/proc`.
+2. **Catch the next exec or open.** `fanotify` watches for `exec` of the selected native inode, or for the first open of the selected PE by a Wine/Proton loader. The kernel holds the operation until the daemon answers, which gives the daemon time to create `/sys/fs/cgroup/netscope/<profile>` and move the new process into it. A name target holds the Wine/Proton loader binaries and matches the loader's launcher ancestry or its command line against the target name, so a new game launch is also caught before its first socket. An already-running process is attached by the poll.
 3. **Match on the cgroup or the profile mark.** nftables rules use `socket cgroupv2` for processes moved before their first socket. A process attached after it already held sockets has those sockets marked with the profile's firewall mark, and a second `socket mark` rule matches them. A process cannot escape the cgroup match by renaming itself or by being re-parented.
 4. **Filter or mark.** A filter profile accepts or drops matching packets. A route profile sets a firewall mark on them.
 5. **Route by mark.** For route profiles, an `ip rule` sends marked packets to a dedicated routing table containing the tunnel route and a higher-metric blackhole default.
@@ -20,11 +20,11 @@ Each profile gets a bounded set of host identifiers:
 |---|---|---|---|
 | Firewall mark | `0x4e53` | `+ index` | 32 profiles |
 | Routing table | `20000` | `+ index` | 32 profiles |
-| Rule priority | `1000` | `+ index` | 32 profiles |
-| nftables table | — | `netscope_filter_<id>` or `netscope_route_<id>` | one per profile |
+| Rule priority | `1000` | `+ index × 32` | 32 profiles |
+| nftables table | — | `netscope_<id>` | one per profile |
 | cgroup | `/sys/fs/cgroup/netscope` | `/<id>` | one per profile |
 
-A profile ID is 1–32 characters: lowercase ASCII letters, digits, and `-`, starting with a letter or digit. The nftables table name replaces `-` with `_`, so `my-game` becomes `netscope_filter_my_game`.
+A profile ID is 1–32 characters: lowercase ASCII letters, digits, and `-`, starting with a letter or digit. The nftables table name replaces `-` with `_`, so `my-game` becomes `netscope_my_game`.
 
 ## Pre-exec attachment
 
@@ -54,30 +54,39 @@ Wine itself is not installed by netscope and is not required to configure a prof
 
 ## Name targets
 
-A `--process <name>` target is for a running app whose install path you do not
-want to store. It is the only target kind that needs no file identity:
+A `--process <name>` target needs no install path. It covers both a new launch
+and an already-running app:
 
 - The daemon scans `/proc` on the poll interval and reads each process's
   `comm` and command line.
-- A process matches when its `comm` equals the name, or when any argv token's
-  basename equals it. Matching is case-insensitive and drops a trailing
-  `.exe`, so `Overwatch`, `Overwatch.exe`, and `overwatch.exe` select the same
-  process; `C:\Games\Overwatch.exe` matches as an argv token, but a path is not
-  an accepted target value.
-- The matching process and its descendants are moved into the profile cgroup.
-  `status` reports the target as `name:<name>` and the attach source as `late`.
-- A process already running is attached on the next poll. A process started
-  later is attached within one poll interval.
-- Sockets that the process already held are marked with the profile's firewall
-  mark as part of the attach, so their next packets follow the profile too.
-  The mark is also what the nftables rules match for those sockets.
+- A process matches when its `comm` or its executable (`argv[0]`) basename
+  equals the name. A Wine loader also matches when any argv token's basename
+  equals it, because Wine carries the PE there. Matching is case-insensitive
+  and drops a trailing `.exe`, so `Overwatch`, `Overwatch.exe`, and
+  `overwatch.exe` select the same process; `C:\Games\Overwatch.exe` matches as
+  a Wine argv token, but a path is not an accepted target value.
+- For a new Wine/Proton launch, the daemon holds the loader binaries with
+  `FAN_OPEN_EXEC_PERM`. If the loader's launcher ancestry or the loader's own
+  command line names the target, the loader is moved into the cgroup before it
+  runs, and the game inherits it. The daemon then learns the PE path from that
+  command line and holds the PE open, so the next launch is caught even if the
+  loader path changes.
+- An already-running process is attached on the next poll. Sockets it already
+  held are marked with the profile's firewall mark, so their next packets
+  follow the profile too.
+- `status` reports the target as `name:<name>` and the attach source as
+  `pre-exec` for a loader-held launch or `late` for a running process.
 
 Name targets cannot distinguish two processes with the same name; both are
-attached.
+attached. The loader hold only covers Wine/Proton binaries the daemon can find
+and whose launcher ancestry or command line names the target; a custom build
+outside the scanned directories, or a launcher that does not name the game,
+falls back to late attach. The PE hold is learned only from an absolute, `Z:\`, or `C:\`
+path in that command line.
 
 ## Late attachment (poll fallback)
 
-If fanotify cannot be used — for example because the kernel or a security policy refuses the permission group — the daemon scans `/proc` on an interval (`poll_interval_ms`, default 1000 ms). It attaches matching processes and their children after the fact. For a native target it matches the executable path. For a Wine target it requires a Wine process and matches the configured PE path against the process command line, accepting a Windows-style `Z:\...` path and the `C:\...` form that maps under `/drive_c/`. Name targets always use this path.
+If fanotify cannot be used — for example because the kernel or a security policy refuses the permission group — the daemon scans `/proc` on an interval (`poll_interval_ms`, default 1000 ms). It attaches matching processes and their children after the fact. For a native target it matches the executable path. For a Wine target it requires a Wine process and matches the configured PE path against the process command line, accepting a Windows-style `Z:\...` path and the `C:\...` form that maps under `/drive_c/`. Name targets use this path when the process was already running.
 
 Late attachment covers sockets that already exist. After moving the process
 into its cgroup, the daemon walks `/proc/<pid>/fd`, duplicates each descriptor
@@ -85,6 +94,8 @@ with `pidfd_getfd`, and sets `SO_MARK` to the profile's mark on every IPv4 and
 IPv6 socket it finds. Changing the mark resets the kernel's cached destination,
 so the next packet is routed through the profile's table. The nftables chain
 matches those sockets with `socket mark` in addition to `socket cgroupv2`.
+Name targets use this path for a process that was already running; a new Wine
+launch is caught by the loader hold instead.
 
 This needs `CAP_NET_ADMIN` and the ability to inspect the target process, which
 the root daemon has. If a descriptor cannot be reached, the attach is reported
@@ -118,13 +129,18 @@ Because the health loop recreates missing state, removing a profile with `netsco
 
 ## Filter evaluation
 
-A filter profile's table hooks `output` in the `inet` family. Rules are evaluated in order:
+A profile's nftables table hooks `output` in the `inet` family. Rules are evaluated in order:
 
-- **`--filter drop`:** accept IPv4 `127.0.0.0/8` and IPv6 `::1/128`, accept each `--allow-cidr`, then drop everything else.
+- **`--filter drop`:** drop IPv4 traffic except loopback `127.0.0.0/8` and the `--allow-cidr` destinations; drop IPv6 except `::1/128` and allowed IPv6 destinations; drop non-IP traffic too. Loopback is always allowed.
 - **`--filter allow`:** drop each `--deny-cidr`; the chain policy accepts everything else. At least one deny CIDR is required, otherwise the profile would do nothing.
 
 Only packets with a socket in the profile's cgroup or carrying the profile's
 mark are matched. See [Filter mode](modes/filter.md).
+
+A shared profile can carry several filter policies, one per consumer. They are
+emitted before the route mark. A drop from any consumer is terminal; an accepted
+packet falls through to the route mark, so a filter never silently replaces a
+route. See [Shared scopes](shared-scopes.md).
 
 ## Route evaluation
 
@@ -133,7 +149,7 @@ A route profile's table accepts loopback, optionally accepts LAN destinations, o
 - a real default route through the configured interface at metric 100;
 - a blackhole default at metric 1000.
 
-When the interface is up, the real route wins. When it is down, the blackhole matches instead of falling back to the main table. See [Route mode](modes/route.md) for the exact fail-open cases.
+When the interface is up, the real route wins. When it is down, the blackhole matches instead of falling back to the main table. Each route exception adds an `ip rule` to `main` at a lower priority number than the profile's mark rule, so it is evaluated first and that destination stays direct while everything else uses the profile's table. See [Route mode](modes/route.md) for the exact fail-open cases.
 
 ## What netscope does not do
 

@@ -34,8 +34,9 @@ Scope a Windows game launched through Wine or Proton by selecting the `.exe`:
 
 ```sh
 sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter drop
-sudo netscope --uid "$(id -u)" add game-routed --wine /games/Game/Game.exe --route tun0
 ```
+
+Use `--route tun0` in place of `--filter drop` to route the same target.
 
 Or attach a **running** process by name, with no install path and no wrapper:
 
@@ -44,12 +45,23 @@ sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 ```
 
 `--process` matches a process's `comm` or an argv basename, so `Overwatch`,
-`Overwatch.exe`, and `overwatch.exe` are the same target. It attaches the
-running process on the next poll and marks the sockets it already holds, so a
-restart is not required. Use `--exe` or `--wine` when the first packet must be
-caught before the poll.
+`Overwatch.exe`, and `overwatch.exe` are the same target. A running process is
+attached on the next poll and its existing sockets are marked, so a restart is
+not required. A new Wine/Proton launch is caught before the loader runs, so the
+game's first socket is already scoped.
 
-`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, name targets are caught on the poll, and Steam apps are matched by app id.
+`netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, name targets hold the Wine loader, and Steam apps are matched by app id.
+
+Two programs can share one process without fighting over its cgroup:
+
+```sh
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
+  --allow-cidr 34.0.0.0/8
+```
+
+Both consumers get the same profile and cgroup. Each owns its own policy; the
+last `netscope close` removes the scope. See [shared scopes](docs/src/shared-scopes.md).
 
 ## How it works
 
@@ -57,7 +69,7 @@ caught before the poll.
 2. nftables matches `socket cgroupv2` or the profile's `socket mark` and applies a filter or a routing mark.
 3. Route profiles set a dedicated routing table with a blackhole fallback. If the configured interface is down, traffic is dropped rather than leaking through the main table.
 
-A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, name targets, and Steam children. When a process is attached late, the daemon marks its existing sockets with the profile mark; the nftables rules match either the cgroup or that mark, so those sockets change route on the next packet without a restart.
+A name target also holds the Wine/Proton loader binaries and matches the launcher ancestry of the loader, so a new game launch is caught before its first socket. A polling fallback attaches already-running processes, Wine/Proton processes matched by command line, and Steam children. When a process is attached late, the daemon marks its existing sockets with the profile mark; the nftables rules match either the cgroup or that mark, so those sockets change route on the next packet without a restart.
 
 ## Security
 

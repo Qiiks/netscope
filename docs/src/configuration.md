@@ -49,7 +49,7 @@ The CLI accepts a hidden `--socket <path>` override. It exists for tests and for
 
 ## State file
 
-`state_path` holds a versioned JSON document with one entry per profile. It stores the target kind and identity — a native executable path, a Windows PE path for a `--wine` profile, a process name for a `--process` profile, or a Steam app ID — the mode, the profile's mark, table, priority, and index, and timestamps. A Wine entry records the canonical PE path with its device and inode, so the daemon can re-stat the file and move the fanotify open mark when it is replaced. A name entry stores only the name; there is no inode to refresh. The daemon owns it:
+`state_path` holds a versioned JSON document with one entry per profile. It stores the target kind and identity — a native executable path, a Windows PE path for a `--wine` profile, a process name for a `--process` profile, or a Steam app ID — each consumer's claim and policy, the profile's mark, table, priority, and index, pre-open fanotify marks, and timestamps. Version 1 profiles are migrated on load: their single mode becomes the `netscope-cli` consumer's policy with a persistent claim. Peer claims belong to a live control connection and are dropped on load, so a crashed consumer cannot leave a scope claimed forever. A Wine or name profile records the canonical PE paths with device and inode, so the daemon can re-stat the files and move a fanotify mark when a game updates. The daemon owns it:
 
 - Do not edit it while `netscoped` is running.
 - Back it up before an upgrade if you have profiles you cannot recreate easily.
@@ -60,8 +60,8 @@ The CLI accepts a hidden `--socket <path>` override. It exists for tests and for
 
 - At most 32 profiles, regardless of `max_profiles`. Lowering `max_profiles` does not delete existing profiles, but adding beyond the limit fails.
 - Profile IDs are 1–32 characters: `[a-z0-9][a-z0-9-]*`.
-- Marks, tables, and rule priorities are allocated from fixed ranges. Exhausting the 32 indexes fails the add. A route table already in use is refused rather than shared.
-- One profile has one mode. Editing a profile means remove and add.
+- Marks, tables, and rule priorities are allocated from fixed ranges. Exhausting the 32 indexes fails the add. A route table used by an active profile is refused; a table left by a removed profile is cleaned up on the next daemon reconcile.
+- One shared profile has one route policy and any number of filter policies, one per consumer. Policies are replaced with `netscope policy`; the target itself is not edited in place.
 
 ## Logging
 

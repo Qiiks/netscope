@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ModeSpec, TargetSpec};
+use crate::types::{Hold, PolicySpec, TargetSpec};
 
-pub const API_VERSION: u32 = 1;
-pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub const API_VERSION: u32 = 2;
+pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -12,10 +12,41 @@ pub enum RequestOp {
     Status,
     List,
     Add(AddProfile),
-    Remove { name: String },
-    Enable { name: String },
-    Disable { name: String },
+    Remove {
+        name: String,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
     Refresh,
+    /// Register a consumer on a shared process scope. Idempotent per
+    /// `(target, target_uid, consumer)`.
+    Open(OpenScope),
+    /// Release one consumer's claim; the profile is removed when it was the
+    /// last claim.
+    Close {
+        profile: String,
+        consumer: String,
+    },
+    /// Replace one consumer's policy atomically.
+    SetPolicy {
+        profile: String,
+        consumer: String,
+        policy: PolicySpec,
+    },
+    ClearPolicy {
+        profile: String,
+        consumer: String,
+    },
+    /// Look up a profile by id or by its shared identity.
+    Resolve {
+        profile: Option<String>,
+        target: Option<TargetSpec>,
+        target_uid: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,8 +88,38 @@ impl Response {
 pub struct AddProfile {
     pub name: String,
     pub target: TargetSpec,
-    pub mode: ModeSpec,
+    pub mode: PolicySpec,
     pub target_uid: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenScope {
+    pub consumer: String,
+    pub target: TargetSpec,
+    pub target_uid: u32,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub hold: Hold,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopeHandle {
+    pub profile: String,
+    pub generation: u64,
+    pub target: String,
+    pub target_uid: u32,
+    pub state: String,
+    pub attached: String,
+    pub pids: Vec<u32>,
+    pub consumers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloseResult {
+    pub profile: String,
+    pub released: bool,
+    pub removed: bool,
+    pub consumers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +141,7 @@ pub struct ProfileStatus {
     pub enabled: bool,
     pub target: String,
     pub cgroup: String,
+    pub cgroup_level: u32,
     pub pids: Vec<u32>,
     pub nft_table: String,
     pub mark: String,
@@ -88,4 +150,10 @@ pub struct ProfileStatus {
     pub attached: String,
     pub healthy: bool,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub consumers: Vec<String>,
+    #[serde(default)]
+    pub policies: Vec<String>,
+    #[serde(default)]
+    pub generation: u64,
 }

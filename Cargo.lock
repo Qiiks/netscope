@@ -317,6 +317,7 @@ dependencies = [
  "anyhow",
  "libc",
  "netscope-linux",
+ "serde",
  "serde_json",
  "tokio",
  "toml",

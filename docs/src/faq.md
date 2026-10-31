@@ -18,7 +18,7 @@ This is a scope decision, not a claim that eBPF is unsuitable for every workload
 
 ## Is there a wrapper?
 
-No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. A native app is selected at `exec` through fanotify; a Windows PE is selected when Wine opens it; a name target is caught by the poller; otherwise the poller catches it late.
+No. You launch the application normally. There is no `netscope run -- app`, no `LD_PRELOAD`, and no proxy environment variable to set. A native app is selected at `exec` through fanotify; a Windows PE is selected when Wine opens it; a name target holds the Wine/Proton loader and catches a new launch before its first socket, and the poller catches an already-running process late.
 
 ## Can I select a running app by name without a path?
 
@@ -28,7 +28,7 @@ Yes. `--process <name>` attaches a running process by its `comm` or an argv base
 sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 ```
 
-Matching is case-insensitive and a trailing `.exe` is optional. This is a late attach: the process is moved into the profile cgroup on the next poll. Sockets it already held are marked with the profile mark at the same time, so their next packets follow the profile too; a restart is not required. Use `--exe` or `--wine` when the very first packet must be caught before the poll.
+Matching is case-insensitive and a trailing `.exe` is optional. A new Wine/Proton launch is caught by the loader hold before its first socket; a process that was already running is attached on the next poll, and the sockets it already held are marked with the profile mark at the same time, so their next packets follow the profile too. A restart is not required.
 
 ## What about applications that are already running?
 
@@ -62,7 +62,7 @@ An application that starts before the daemon is attached late; its existing sock
 
 ## Can I edit a profile?
 
-Not in v0.2.0. Remove it and add it again with the new target or mode. `enable` and `disable` toggle enforcement without changing the definition.
+A consumer's policy can be replaced with `netscope policy <profile> --consumer <id> ...`. The target itself is not edited in place; remove and re-add to change it. `enable` and `disable` toggle enforcement without changing the definition.
 
 ## Can one profile cover several applications?
 
@@ -70,7 +70,12 @@ No. One profile has one target: a native executable, a running process name, a W
 
 ## Can two profiles target the same application?
 
-Yes, but each gets its own cgroup and rules. Running the application would attach it to one of them, not both. Use one profile per application unless you have a specific reason not to.
+Two consumers that name the same target and target uid join one profile and
+cgroup through `netscope open`, so they share the process identity instead of
+competing for it. Each consumer has its own policy; a profile carries one route
+policy and any number of filter policies. A second `netscope add` for the same
+target and uid is refused with `target already scoped`; use `open` when two
+programs need the same app.
 
 ## Does it capture or log my traffic?
 
@@ -96,7 +101,7 @@ Only a Wine process running the selected PE is attached. Another program that op
 
 If fanotify cannot be used, the fallback matches Wine processes by command line, including `Z:\...` paths and the `C:\...`/`/drive_c/` form, and attaches late. Sockets opened during startup are marked at attach, so their next packets follow the profile; restart only if the daemon reports a mark failure.
 
-For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. If you do not want to store a path, `--process Overwatch.exe` attaches the running game by name on the next poll; sockets it already held are marked. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
+For Proton, select the actual PE path that Wine opens; a copy under `steamapps/compatdata/<appid>/pfx/drive_c/` is a different file from the one under `steamapps/common/`. `--steam <appid>` remains available for app-id matching. If you do not want to store a path, `--process Overwatch.exe` holds the Wine loader for a new launch and learns the PE from the loader's command line; a game that was already running attaches on the next poll, with its existing sockets marked. Flatpak, Snap, and unusual filesystems are not tested: if the profile does not attach, check `netscope status` and restart the game. Real Wine and Proton launches are not covered by the project's automated tests; the attach path is exercised with a Wine-named test loader, so report a reproducible failure.
 
 ## Is it a firewall?
 

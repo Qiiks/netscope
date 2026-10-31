@@ -403,8 +403,14 @@ fn check_state(
 
 fn validate_state(state: &State, max_profiles: u8) -> Vec<String> {
     let mut problems = Vec::new();
-    if state.version != 1 {
-        problems.push(format!("state version {} is not 1", state.version));
+    // v1 is migrated by the daemon on its next start; doctor may run while it
+    // is stopped.
+    let expected_version = State::default().version;
+    if state.version != 1 && state.version != expected_version {
+        problems.push(format!(
+            "state version {} is not 1 or {expected_version}",
+            state.version
+        ));
     }
     let mut indexes = std::collections::HashSet::new();
     for (id, profile) in &state.profiles {
@@ -447,31 +453,48 @@ fn validate_state(state: &State, max_profiles: u8) -> Vec<String> {
                 }
             }
         }
-        match &profile.mode {
-            Mode::Filter { exceptions, .. } => {
-                for cidr in exceptions {
-                    if !cidr_valid(cidr) {
-                        problems.push(format!("profile '{id}' has invalid CIDR '{cidr}'"));
+        if profile
+            .policies
+            .values()
+            .filter(|policy| matches!(policy, Mode::Route { .. }))
+            .count()
+            > 1
+        {
+            problems.push(format!("profile '{id}' has more than one route policy"));
+        }
+        for policy in profile.policies.values() {
+            match policy {
+                Mode::Filter { exceptions, .. } => {
+                    for cidr in exceptions {
+                        if !cidr_valid(cidr) {
+                            problems.push(format!("profile '{id}' has invalid CIDR '{cidr}'"));
+                        }
                     }
                 }
-            }
-            Mode::Route {
-                interface,
-                gateway,
-                gateway6,
-                ..
-            } => {
-                if interface.is_empty() {
-                    problems.push(format!("profile '{id}' has an empty interface"));
-                }
-                if let Some(gateway) = gateway {
-                    if gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv4()) {
-                        problems.push(format!("profile '{id}' has invalid IPv4 gateway"));
+                Mode::Route {
+                    interface,
+                    gateway,
+                    gateway6,
+                    except,
+                    ..
+                } => {
+                    if interface.is_empty() {
+                        problems.push(format!("profile '{id}' has an empty interface"));
                     }
-                }
-                if let Some(gateway) = gateway6 {
-                    if gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv6()) {
-                        problems.push(format!("profile '{id}' has invalid IPv6 gateway"));
+                    if let Some(gateway) = gateway {
+                        if gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv4()) {
+                            problems.push(format!("profile '{id}' has invalid IPv4 gateway"));
+                        }
+                    }
+                    if let Some(gateway) = gateway6 {
+                        if gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv6()) {
+                            problems.push(format!("profile '{id}' has invalid IPv6 gateway"));
+                        }
+                    }
+                    for cidr in except {
+                        if !cidr_valid(cidr) {
+                            problems.push(format!("profile '{id}' has invalid exception '{cidr}'"));
+                        }
                     }
                 }
             }
@@ -530,18 +553,22 @@ fn check_profile_runtime(config: &Config, state: Option<&State>) -> Check {
             }
             Err(err) => problems.push(format!("{}: cgroup root: {err}", profile.id)),
         }
-        match &nft {
-            Ok(manager) => match manager.exists(profile) {
-                Ok(true) => {}
-                Ok(false) => problems.push(format!("{}: missing nft table", profile.id)),
+        if !profile.policies.is_empty() {
+            match &nft {
+                Ok(manager) => match manager.exists(profile) {
+                    Ok(true) => {}
+                    Ok(false) => problems.push(format!("{}: missing nft table", profile.id)),
+                    Err(err) => problems.push(format!("{}: nft: {err}", profile.id)),
+                },
                 Err(err) => problems.push(format!("{}: nft: {err}", profile.id)),
-            },
-            Err(err) => problems.push(format!("{}: nft: {err}", profile.id)),
+            }
         }
-        match ip::exists(profile) {
-            Ok(true) => {}
-            Ok(false) => problems.push(format!("{}: missing ip rule/route", profile.id)),
-            Err(err) => problems.push(format!("{}: ip: {err}", profile.id)),
+        if profile.has_route() {
+            match ip::exists(profile) {
+                Ok(true) => {}
+                Ok(false) => problems.push(format!("{}: missing ip rule/route", profile.id)),
+                Err(err) => problems.push(format!("{}: ip: {err}", profile.id)),
+            }
         }
     }
 

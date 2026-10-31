@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,16 +15,18 @@ use netscope_linux::ip;
 use netscope_linux::nft::NftManager;
 use netscope_linux::proc;
 use netscope_linux::protocol::{
-    AddProfile, ProfileStatus, Request, RequestOp, Response, StatusData, API_VERSION,
-    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    AddProfile, CloseResult, OpenScope, ProfileStatus, Request, RequestOp, Response, ScopeHandle,
+    StatusData, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 use netscope_linux::run;
 use netscope_linux::sockets::{self, SocketMarkError};
 use netscope_linux::types::{
-    mark, profile_id_valid, rule_priority, table, table_name, Config, FilterDefault, Mode,
-    ModeSpec, Profile, ProfileId, State, Target, TargetSpec, MAX_PROFILES,
+    consumer_id_valid, mark, profile_id_valid, rule_priority, suggest_profile_id, table,
+    table_name, Claim, Config, FilterDefault, Hold, Policy, PolicySpec, Preopen, Profile,
+    ProfileId, State, Target, TargetKind, TargetSpec, MARK_BASE, MAX_PROFILES,
 };
 use netscope_linux::watcher::{self, ExecEvent};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -59,12 +61,13 @@ struct Rt {
     fanotify_ok: AtomicBool,
     inner: Mutex<Inner>,
     shutting_down: AtomicBool,
+    next_connection: AtomicU64,
 }
 
 struct Inner {
     state: State,
     provenance: HashMap<u32, AttachSource>,
-    marked: HashSet<u32>,
+    marked: HashMap<ProfileId, HashSet<u32>>,
     health: HashMap<String, bool>,
 }
 
@@ -128,10 +131,11 @@ async fn async_main() -> Result<(), String> {
         inner: Mutex::new(Inner {
             state: State::default(),
             provenance: HashMap::new(),
-            marked: HashSet::new(),
+            marked: HashMap::new(),
             health: HashMap::new(),
         }),
         shutting_down: AtomicBool::new(false),
+        next_connection: AtomicU64::new(1),
     });
 
     {
@@ -183,7 +187,8 @@ async fn async_main() -> Result<(), String> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        tokio::spawn(serve_connection(stream, rt.clone()));
+                        let connection = rt.next_connection.fetch_add(1, Ordering::SeqCst);
+                        tokio::spawn(serve_connection(stream, rt.clone(), connection));
                     }
                     Err(err) => {
                         warn!("accept failed: {err}");
@@ -377,14 +382,35 @@ fn config_integer(value: &toml::Value, key: &str) -> Result<u64, String> {
     u64::try_from(number).map_err(|_| format!("config: {key} must be a non-negative integer"))
 }
 
+#[derive(Deserialize)]
+struct StateV1 {
+    profiles: BTreeMap<ProfileId, ProfileV1>,
+}
+
+#[derive(Deserialize)]
+struct ProfileV1 {
+    id: ProfileId,
+    target: Target,
+    target_uid: u32,
+    owner_uid: u32,
+    mode: Policy,
+    index: u8,
+    mark: u32,
+    table: u32,
+    rule_priority: u32,
+    enabled: bool,
+    created_at: String,
+    updated_at: String,
+}
+
 fn load_state(path: &Path) -> Result<State, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
         Err(err) => return Err(format!("state: read {}: {err}", path.display())),
     };
-    let state: State = match serde_json::from_str(&text) {
-        Ok(state) => state,
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
         Err(err) => {
             let moved = corrupt_path(path);
             fs::rename(path, &moved).map_err(|rename| {
@@ -397,9 +423,74 @@ fn load_state(path: &Path) -> Result<State, String> {
             return Ok(State::default());
         }
     };
-    if state.version != 1 {
-        return Err(format!("state: unsupported version {}", state.version));
+    let version = value.get("version").and_then(Value::as_u64).unwrap_or(0);
+    let state = match version {
+        1 => {
+            let old: StateV1 =
+                serde_json::from_value(value).map_err(|err| format!("state: invalid v1: {err}"))?;
+            let mut state = State::default();
+            for (id, profile) in old.profiles {
+                let mut claims = BTreeMap::new();
+                claims.insert("netscope-cli".to_string(), Claim::persistent());
+                let mut policies = BTreeMap::new();
+                policies.insert("netscope-cli".to_string(), profile.mode);
+                state.profiles.insert(
+                    id,
+                    Profile {
+                        id: profile.id,
+                        target: profile.target,
+                        target_uid: profile.target_uid,
+                        owner_uid: profile.owner_uid,
+                        claims,
+                        policies,
+                        preopen: Vec::new(),
+                        index: profile.index,
+                        mark: profile.mark,
+                        table: profile.table,
+                        // Old releases packed priorities one apart; exceptions
+                        // need the strided band below each mark rule.
+                        rule_priority: rule_priority(profile.index),
+                        enabled: profile.enabled,
+                        generation: 0,
+                        created_at: profile.created_at,
+                        updated_at: profile.updated_at,
+                    },
+                );
+            }
+            state
+        }
+        2 => serde_json::from_value(value).map_err(|err| format!("state: invalid v2: {err}"))?,
+        other => return Err(format!("state: unsupported version {other}")),
+    };
+    let mut state = state;
+    for profile in state.profiles.values_mut() {
+        if matches!(profile.target, Target::Name { .. })
+            && !profile
+                .preopen
+                .iter()
+                .any(|preopen| preopen.kind == TargetKind::Native)
+        {
+            profile.preopen.extend(loader_preopen());
+        }
+        let dead: Vec<String> = profile
+            .claims
+            .iter()
+            .filter(|(_, claim)| claim.hold == Hold::Peer)
+            .map(|(consumer, _)| consumer.clone())
+            .collect();
+        for consumer in dead {
+            profile.claims.remove(&consumer);
+            profile.policies.remove(&consumer);
+        }
     }
+    // Profile ids and marks are reusable: a scope whose last claim was a peer
+    // must not leave its mark on a process that outlived the daemon.
+    for (id, profile) in state.profiles.iter().filter(|(_, p)| p.claims.is_empty()) {
+        clear_all_marks(id, profile.mark);
+    }
+    state
+        .profiles
+        .retain(|_, profile| !profile.claims.is_empty());
     for (id, profile) in &state.profiles {
         if !profile_id_valid(id) || profile.id != *id {
             return Err(format!("state: invalid profile id `{id}`"));
@@ -410,6 +501,11 @@ fn load_state(path: &Path) -> Result<State, String> {
             || profile.rule_priority != rule_priority(profile.index)
         {
             return Err(format!("state: inconsistent routing identity for `{id}`"));
+        }
+        for consumer in profile.claims.keys().chain(profile.policies.keys()) {
+            if !consumer_id_valid(consumer) {
+                return Err(format!("state: invalid consumer `{consumer}`"));
+            }
         }
     }
     Ok(state)
@@ -540,13 +636,33 @@ fn now_rfc3339() -> String {
 }
 
 fn reconcile(rt: &Rt, inner: &mut Inner) -> Result<(), String> {
-    let dirty = restat_targets(rt, inner);
+    let mut dirty = restat_targets(rt, inner);
     let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
     for id in ids {
-        let Some(profile) = inner.state.profiles.get(&id).cloned() else {
+        let Some(mut profile) = inner.state.profiles.get(&id).cloned() else {
             continue;
         };
+        if profile.enabled
+            && fanotify_active(rt)
+            && matches!(profile.target, Target::Name { .. })
+            && !profile
+                .preopen
+                .iter()
+                .any(|preopen| preopen.kind == TargetKind::Native)
+        {
+            profile.preopen.extend(loader_preopen());
+            profile.updated_at = now_rfc3339();
+            if let Some(stored) = inner.state.profiles.get_mut(&id) {
+                stored.preopen = profile.preopen.clone();
+                stored.updated_at = profile.updated_at.clone();
+            }
+            dirty += 1;
+        }
         let result = if profile.enabled {
+            // The daemon may have been down while a marked process left the
+            // cgroup; a reused mark index must not capture it. Live processes
+            // are re-marked by attach_matches below.
+            clear_all_marks(&id, profile.mark);
             reconcile_enabled(rt, &profile)
         } else {
             reconcile_disabled(rt, inner, &profile)
@@ -582,7 +698,7 @@ fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
         info!("cgroup recreated profile={}", profile.id);
     }
     rt.nft.apply(profile).map_err(|err| err.to_string())?;
-    if matches!(profile.mode, Mode::Route { .. }) {
+    if profile.has_route() {
         ip::ensure(profile).map_err(|err| err.to_string())?;
     }
     let mut healthy = true;
@@ -598,9 +714,10 @@ fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
 fn reconcile_disabled(rt: &Rt, inner: &mut Inner, profile: &Profile) -> Result<bool, String> {
     if fanotify_active(rt) {
         remove_target_mark(rt, profile);
+        remove_loader_marks(rt, inner, profile);
     }
     rt.nft.remove(profile).map_err(|err| err.to_string())?;
-    if matches!(profile.mode, Mode::Route { .. }) {
+    if profile.has_route() {
         ip::remove(profile).map_err(|err| err.to_string())?;
     }
     let pids = rt.cgroup.procs(&profile.id).unwrap_or_default();
@@ -608,10 +725,11 @@ fn reconcile_disabled(rt: &Rt, inner: &mut Inner, profile: &Profile) -> Result<b
         .drain(&profile.id)
         .map_err(|err| err.to_string())?;
     clear_socket_marks(&profile.id, profile.mark, &pids);
+    clear_all_marks(&profile.id, profile.mark);
     for pid in &pids {
         inner.provenance.remove(pid);
-        inner.marked.remove(pid);
     }
+    inner.marked.remove(&profile.id);
     Ok(true)
 }
 
@@ -640,7 +758,7 @@ fn reconcile_orphan_nft(rt: &Rt, inner: &mut Inner) {
         .profiles
         .values()
         .filter(|profile| profile.enabled)
-        .map(|profile| table_name(&profile.mode, &profile.id))
+        .map(|profile| table_name(&profile.id))
         .collect();
     let tables = match rt.nft.list_tables() {
         Ok(tables) => tables,
@@ -650,7 +768,7 @@ fn reconcile_orphan_nft(rt: &Rt, inner: &mut Inner) {
         }
     };
     for name in tables {
-        if !(name.starts_with("netscope_filter_") || name.starts_with("netscope_route_")) {
+        if !name.starts_with("netscope_") {
             continue;
         }
         if names.iter().any(|expected| expected == &name) {
@@ -663,12 +781,26 @@ fn reconcile_orphan_nft(rt: &Rt, inner: &mut Inner) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct IpRule {
     family: i32,
     mark: u32,
     table: u32,
     priority: u32,
+    dst: Option<String>,
+}
+
+fn profile_allows_ipv6(profile: &Profile) -> bool {
+    matches!(
+        profile.route_policy(),
+        Some((
+            _,
+            Policy::Route {
+                allow_ipv6: true,
+                ..
+            }
+        ))
+    )
 }
 
 fn reconcile_orphan_ip(inner: &mut Inner) {
@@ -676,7 +808,7 @@ fn reconcile_orphan_ip(inner: &mut Inner) {
         .state
         .profiles
         .values()
-        .filter(|profile| matches!(profile.mode, Mode::Route { .. }))
+        .filter(|profile| profile.enabled && profile.has_route())
         .map(|profile| profile.table)
         .collect();
     let rules = match ip_rules() {
@@ -686,30 +818,100 @@ fn reconcile_orphan_ip(inner: &mut Inner) {
             return;
         }
     };
+    let used_marks: Vec<u32> = inner
+        .state
+        .profiles
+        .values()
+        .filter(|profile| profile.enabled && profile.has_route())
+        .map(|profile| profile.mark)
+        .collect();
+    let expected: Vec<(i32, u32, u32)> = inner
+        .state
+        .profiles
+        .values()
+        .filter(|profile| profile.enabled && profile.has_route())
+        .flat_map(|profile| {
+            [4, 6]
+                .into_iter()
+                .filter(|family| *family == 4 || profile_allows_ipv6(profile))
+                .map(move |family| (family, profile.mark, profile.rule_priority))
+        })
+        .collect();
+    let mut expected_exceptions: Vec<(i32, u32, u32, String)> = Vec::new();
+    for profile in inner
+        .state
+        .profiles
+        .values()
+        .filter(|profile| profile.enabled)
+    {
+        let Some((
+            _,
+            Policy::Route {
+                allow_ipv6, except, ..
+            },
+        )) = profile.route_policy()
+        else {
+            continue;
+        };
+        for family in [4, 6] {
+            if family == 6 && !allow_ipv6 {
+                continue;
+            }
+            for (offset, cidr) in ip::route_exceptions(except, family).into_iter().enumerate() {
+                let priority = profile.rule_priority.saturating_sub(1 + offset as u32);
+                expected_exceptions.push((family, profile.mark, priority, cidr));
+            }
+        }
+    }
     let mut flushed: Vec<(i32, u32)> = Vec::new();
     for rule in rules {
-        if !(20000..=20031).contains(&rule.table) || used.contains(&rule.table) {
+        let netscope_mark =
+            rule.mark >= MARK_BASE && rule.mark < MARK_BASE + u32::from(MAX_PROFILES);
+        if rule.table == 254 {
+            if !netscope_mark || rule.dst.is_none() {
+                continue;
+            }
+            let expected_rule = used_marks.contains(&rule.mark)
+                && expected_exceptions
+                    .iter()
+                    .any(|(family, mark, priority, dst)| {
+                        *family == rule.family
+                            && *mark == rule.mark
+                            && *priority == rule.priority
+                            && rule.dst.as_deref() == Some(dst.as_str())
+                    });
+            if expected_rule {
+                continue;
+            }
+        } else if (20000..=20031).contains(&rule.table) && used.contains(&rule.table) {
+            // A profile from an older release kept its packed priority; drop
+            // that rule so the current strided rule is the one that matches.
+            if expected.contains(&(rule.family, rule.mark, rule.priority)) {
+                continue;
+            }
+        } else if !(20000..=20031).contains(&rule.table) || used.contains(&rule.table) {
             continue;
         }
         let flag = if rule.family == 6 { "-6" } else { "-4" };
         let mark_arg = format!("0x{:x}", rule.mark);
         let table_arg = rule.table.to_string();
         let priority_arg = rule.priority.to_string();
-        let _ = run(
-            "ip",
-            &[
-                flag,
-                "rule",
-                "del",
-                "fwmark",
-                &mark_arg,
-                "table",
-                &table_arg,
-                "pref",
-                &priority_arg,
-            ],
-            None,
-        );
+        let mut args = vec![flag, "rule", "del"];
+        if let Some(dst) = &rule.dst {
+            args.extend(["to", dst, "fwmark", &mark_arg]);
+        } else {
+            args.extend(["fwmark", &mark_arg]);
+        }
+        args.extend(["table", &table_arg, "pref", &priority_arg]);
+        let _ = run("ip", &args, None);
+        if rule.table == 254 {
+            info!("orphan ip exception removed mark={mark_arg}");
+            continue;
+        }
+        if used.contains(&rule.table) {
+            info!("stale ip rule removed mark={mark_arg} table={}", rule.table);
+            continue;
+        }
         let key = (rule.family, rule.table);
         if !flushed.contains(&key) {
             let _ = run("ip", &[flag, "route", "flush", "table", &table_arg], None);
@@ -737,7 +939,7 @@ fn ip_rules() -> Result<Vec<IpRule>, String> {
             else {
                 continue;
             };
-            let Some(table) = entry.get("table").and_then(value_u32) else {
+            let Some(table) = entry.get("table").and_then(rule_table) else {
                 continue;
             };
             let Some(priority) = entry
@@ -747,15 +949,31 @@ fn ip_rules() -> Result<Vec<IpRule>, String> {
             else {
                 continue;
             };
+            let dst = entry.get("dst").and_then(Value::as_str).map(|dst| {
+                entry
+                    .get("dstlen")
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| dst.to_string(), |len| format!("{dst}/{len}"))
+            });
             rules.push(IpRule {
                 family,
                 mark,
                 table,
                 priority,
+                dst,
             });
         }
     }
     Ok(rules)
+}
+
+fn rule_table(value: &Value) -> Option<u32> {
+    match value.as_str() {
+        Some("main") => Some(254),
+        Some("local") => Some(255),
+        Some("default") => Some(253),
+        _ => value_u32(value),
+    }
 }
 
 fn value_u32(value: &Value) -> Option<u32> {
@@ -782,13 +1000,21 @@ fn attach_matches(rt: &Rt, inner: &mut Inner) {
     matches.extend(proc::scan_steam(&profiles));
     matches.extend(proc::scan_wine(&profiles));
     matches.extend(proc::scan_name(&profiles));
+    // Cgroup membership is the authoritative scope: a descendant that does not
+    // answer to the selector still needs its established sockets re-marked after
+    // a restart cleared them.
+    for profile in &profiles {
+        if let Ok(pids) = rt.cgroup.procs(&profile.id) {
+            matches.extend(pids.into_iter().map(|pid| (profile.id.clone(), pid)));
+        }
+    }
     for (id, pid) in matches {
         attach_one(rt, inner, &id, pid, AttachSource::Late);
     }
 }
 
 fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSource) {
-    let Some(profile) = inner.state.profiles.get(id) else {
+    let Some(mut profile) = inner.state.profiles.get(id).cloned() else {
         return;
     };
     if !profile.enabled {
@@ -803,20 +1029,36 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
         ) {
             return;
         }
-        if !inner.marked.contains(&pid) && mark_sockets(id, mark, pid) {
-            inner.marked.insert(pid);
+        inner.provenance.entry(pid).or_insert(source);
+        if !inner.marked.get(id).is_some_and(|pids| pids.contains(&pid))
+            && mark_sockets(id, mark, pid)
+        {
+            inner.marked.entry(id.to_string()).or_default().insert(pid);
         }
         return;
     }
     match rt.cgroup.attach_tree(pid, id, source) {
         Ok(attached) => {
             for tgid in attached {
-                if !inner.marked.contains(&tgid) && mark_sockets(id, mark, tgid) {
-                    inner.marked.insert(tgid);
+                if !inner
+                    .marked
+                    .get(id)
+                    .is_some_and(|pids| pids.contains(&tgid))
+                {
+                    mark_sockets(id, mark, tgid);
+                    inner.marked.entry(id.to_string()).or_default().insert(tgid);
                 }
                 inner.provenance.insert(tgid, source);
             }
             info!("attach profile={id} pid={pid} source=poll");
+            if matches!(&profile.target, Target::Name { .. })
+                && proc::is_wine_process(pid)
+                && learn_pe(rt, inner, &mut profile, pid)
+            {
+                if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
+                    warn!("state: write after learning PE failed: {err}");
+                }
+            }
         }
         Err(CgroupError::ProcessGone(_)) => {}
         Err(err) => warn!("attach profile={id} pid={pid} error={err}"),
@@ -839,6 +1081,14 @@ fn mark_sockets(id: &str, mark: u32, pid: u32) -> bool {
     }
 }
 
+fn clear_all_marks(id: &str, mark: u32) {
+    match sockets::clear_mark_all(mark) {
+        Ok(0) => {}
+        Ok(count) => info!("cleared profile={id} sockets={count}"),
+        Err(err) => warn!("mark cleanup profile={id} error={err}"),
+    }
+}
+
 fn clear_socket_marks(id: &str, mark: u32, pids: &[u32]) {
     for pid in pids {
         if let Err(err) = sockets::clear_mark(*pid, mark) {
@@ -852,6 +1102,7 @@ fn clear_socket_marks(id: &str, mark: u32, pids: &[u32]) {
 fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
     let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
     let mut changed = 0usize;
+    changed += restat_preopens(rt, inner, &ids);
     for id in ids {
         let Some(profile) = inner.state.profiles.get(&id) else {
             continue;
@@ -864,6 +1115,9 @@ fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
             Target::Steam { .. } | Target::Name { .. } => continue,
         };
         let enabled = profile.enabled;
+        if !enabled {
+            continue;
+        }
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -908,6 +1162,43 @@ fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
     changed
 }
 
+fn restat_preopens(rt: &Rt, inner: &mut Inner, ids: &[ProfileId]) -> usize {
+    let mut changed = 0;
+    for id in ids {
+        let Some(mut profile) = inner.state.profiles.get(id).cloned() else {
+            continue;
+        };
+        if !profile.enabled {
+            continue;
+        }
+        let mut updated = false;
+        for preopen in &mut profile.preopen {
+            let Ok(metadata) = fs::metadata(&preopen.path) else {
+                continue;
+            };
+            if metadata.dev() == preopen.dev && metadata.ino() == preopen.ino {
+                continue;
+            }
+            preopen.dev = metadata.dev();
+            preopen.ino = metadata.ino();
+            updated = true;
+            info!("preopen updated profile={id} path={}", preopen.path);
+        }
+        if !updated {
+            continue;
+        }
+        profile.updated_at = now_rfc3339();
+        if fanotify_active(rt) {
+            if let Err(err) = add_target_mark(rt, &profile) {
+                warn!("fanotify mark profile={id} error={err:?}");
+            }
+        }
+        inner.state.profiles.insert(id.clone(), profile);
+        changed += 1;
+    }
+    changed
+}
+
 fn health_tick(rt: &Rt, inner: &mut Inner) {
     let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
     for id in ids {
@@ -934,21 +1225,23 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
                 }
             }
         }
-        match rt.nft.exists(&profile) {
-            Ok(true) => {}
-            Ok(false) => match rt.nft.apply(&profile) {
-                Ok(()) => info!("health repaired profile={id} component=nft"),
+        if profile.has_policies() {
+            match rt.nft.exists(&profile) {
+                Ok(true) => {}
+                Ok(false) => match rt.nft.apply(&profile) {
+                    Ok(()) => info!("health repaired profile={id} component=nft"),
+                    Err(err) => {
+                        warn!("health profile={id} nft error={err}");
+                        healthy = false;
+                    }
+                },
                 Err(err) => {
                     warn!("health profile={id} nft error={err}");
                     healthy = false;
                 }
-            },
-            Err(err) => {
-                warn!("health profile={id} nft error={err}");
-                healthy = false;
             }
         }
-        if matches!(profile.mode, Mode::Route { .. }) {
+        if profile.has_route() {
             match ip::exists(&profile) {
                 Ok(true) => {}
                 Ok(false) => match ip::ensure(&profile) {
@@ -972,17 +1265,45 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
         }
         if healthy {
             healthy = rt.cgroup.root().join(&id).is_dir()
-                && rt.nft.exists(&profile).unwrap_or(false)
-                && ip::exists(&profile).unwrap_or(false);
+                && (!profile.has_policies() || rt.nft.exists(&profile).unwrap_or(false))
+                && (!profile.has_route() || ip::exists(&profile).unwrap_or(false));
         }
         inner.health.insert(id, healthy);
     }
-    let mut live = std::collections::HashSet::new();
+    let mut live: HashMap<ProfileId, HashSet<u32>> = HashMap::new();
     for profile in inner.state.profiles.values() {
-        live.extend(rt.cgroup.procs(&profile.id).unwrap_or_default());
+        live.insert(
+            profile.id.clone(),
+            rt.cgroup
+                .procs(&profile.id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        );
     }
-    inner.provenance.retain(|pid, _| live.contains(pid));
-    inner.marked.retain(|pid| live.contains(pid));
+    // A process can leave its cgroup without losing the mark. Clear it on the
+    // profile that put it there, or a later profile reusing the mark index
+    // would silently capture that process.
+    for (id, marked) in &inner.marked {
+        let empty = HashSet::new();
+        let live_pids = live.get(id).unwrap_or(&empty);
+        let Some(profile) = inner.state.profiles.get(id) else {
+            continue;
+        };
+        for pid in marked.difference(live_pids).copied().collect::<Vec<_>>() {
+            if let Err(err) = sockets::clear_mark(pid, profile.mark) {
+                debug!("mark cleanup pid={pid} profile={id} error={err}");
+            }
+        }
+    }
+    let all_live: HashSet<u32> = live.values().flatten().copied().collect();
+    inner.provenance.retain(|pid, _| all_live.contains(pid));
+    for (id, marked) in &mut inner.marked {
+        let empty = HashSet::new();
+        let live_pids = live.get(id).unwrap_or(&empty);
+        marked.retain(|pid| live_pids.contains(pid));
+    }
+    inner.marked.retain(|_, marked| !marked.is_empty());
 }
 
 async fn poll_task(rt: Arc<Rt>, period: Duration) {
@@ -1036,9 +1357,27 @@ async fn exec_task(mut rx: mpsc::Receiver<ExecEvent>, rt: Arc<Rt>) {
         warn!("fanotify disabled; poll-only");
     }
     let inner = rt.inner.lock().await;
+    // Every hold must go once no watcher is left to answer it, including a
+    // hold a disabled sibling still records.
     for profile in inner.state.profiles.values() {
-        if profile.enabled {
-            remove_target_mark(&rt, profile);
+        remove_target_mark(&rt, profile);
+        if let Some(fanotify) = &rt.fanotify {
+            for preopen in &profile.preopen {
+                let result = match preopen.kind {
+                    netscope_linux::types::TargetKind::Native => {
+                        fanotify.remove_exec_mark(Path::new(&preopen.path))
+                    }
+                    netscope_linux::types::TargetKind::Wine => {
+                        fanotify.remove_open_mark(Path::new(&preopen.path))
+                    }
+                };
+                if let Err(err) = result {
+                    debug!(
+                        "fanotify unmark on shutdown profile={} path={} error={err:?}",
+                        profile.id, preopen.path
+                    );
+                }
+            }
         }
     }
 }
@@ -1081,47 +1420,169 @@ async fn handle_exec(rt: &Rt, event: ExecEvent) {
                     ino: event_ino,
                     ..
                 } => mask & libc::FAN_OPEN_PERM != 0 && *event_dev == dev && *event_ino == ino,
-                Target::Steam { .. } | Target::Name { .. } => false,
+                Target::Name { name } => {
+                    let loader = mask & libc::FAN_OPEN_EXEC_PERM != 0
+                        && profile.preopen.iter().any(|preopen| {
+                            preopen.kind == TargetKind::Native
+                                && preopen.dev == dev
+                                && preopen.ino == ino
+                                && (proc::loader_parent_matches(name, pid)
+                                    || (proc::is_wine_process(pid)
+                                        && proc::name_pid_matches(
+                                            profile,
+                                            profile.target_uid,
+                                            pid,
+                                        )))
+                        });
+                    let pe = mask & libc::FAN_OPEN_PERM != 0
+                        && profile.preopen.iter().any(|preopen| {
+                            preopen.kind == TargetKind::Wine
+                                && preopen.dev == dev
+                                && preopen.ino == ino
+                        });
+                    loader || pe
+                }
+                Target::Steam { .. } => false,
             }
         })
         .cloned();
     let allow = match profile {
         None => true,
-        Some(profile) => {
-            let source = if matches!(&profile.target, Target::Wine { .. }) {
+        Some(mut profile) => {
+            let pe_open = profile.preopen.iter().any(|preopen| {
+                preopen.kind == TargetKind::Wine && preopen.dev == dev && preopen.ino == ino
+            });
+            let source = if pe_open || matches!(&profile.target, Target::Wine { .. }) {
                 AttachSource::PreOpen
             } else {
                 AttachSource::PreExec
             };
-            if source == AttachSource::PreOpen {
+            let attached = if source == AttachSource::PreOpen {
                 // wineserver often opens the PE before the game process has
                 // its command line; never scope the shared server, attach the
                 // process that is actually running the selected PE.
-                let mut pids = Vec::new();
-                if proc::wine_pid_matches(&profile, pid) {
-                    pids.push(pid);
-                } else {
-                    pids.extend(
-                        proc::scan_wine(std::slice::from_ref(&profile))
+                if matches!(&profile.target, Target::Name { .. }) {
+                    if proc::name_pid_matches(&profile, profile.target_uid, pid) {
+                        attach_event(rt, &mut inner, &profile, pid, source)
+                    } else {
+                        let pids: Vec<u32> = proc::scan_name(std::slice::from_ref(&profile))
                             .into_iter()
-                            .map(|(_, pid)| pid),
-                    );
-                }
-                pids.sort_unstable();
-                pids.dedup();
-                if pids.is_empty() {
-                    true
+                            .map(|(_, pid)| pid)
+                            .collect();
+                        if pids.is_empty() {
+                            true
+                        } else {
+                            pids.into_iter()
+                                .all(|pid| attach_event(rt, &mut inner, &profile, pid, source))
+                        }
+                    }
                 } else {
-                    pids.into_iter()
-                        .all(|pid| attach_event(rt, &mut inner, &profile, pid, source))
+                    let mut pids = Vec::new();
+                    if proc::wine_pid_matches(&profile, pid) {
+                        pids.push(pid);
+                    } else {
+                        pids.extend(
+                            proc::scan_wine(std::slice::from_ref(&profile))
+                                .into_iter()
+                                .map(|(_, pid)| pid),
+                        );
+                    }
+                    pids.sort_unstable();
+                    pids.dedup();
+                    if pids.is_empty() {
+                        true
+                    } else {
+                        pids.into_iter()
+                            .all(|pid| attach_event(rt, &mut inner, &profile, pid, source))
+                    }
                 }
             } else {
                 attach_event(rt, &mut inner, &profile, pid, source)
+            };
+            if attached && matches!(&profile.target, Target::Name { .. }) {
+                if learn_pe_any(rt, &mut inner, &mut profile, pid) {
+                    if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
+                        warn!("state: write after learning PE failed: {err}");
+                    }
+                }
             }
+            attached
         }
     };
     drop(inner);
     let _ = reply.send(allow);
+}
+
+/// Learns the PE path from the event process, or from a process the scope
+/// already matches when a Wine helper opened the PE first.
+fn learn_pe_any(rt: &Rt, inner: &mut Inner, profile: &mut Profile, event_pid: u32) -> bool {
+    if learn_pe(rt, inner, profile, event_pid) {
+        return true;
+    }
+    let pids: Vec<u32> = proc::scan_name(std::slice::from_ref(profile))
+        .into_iter()
+        .map(|(_, pid)| pid)
+        .filter(|pid| *pid != event_pid)
+        .collect();
+    for pid in pids {
+        if learn_pe(rt, inner, profile, pid) {
+            return true;
+        }
+    }
+    false
+}
+
+fn learn_pe(rt: &Rt, inner: &mut Inner, profile: &mut Profile, pid: u32) -> bool {
+    let Target::Name { name } = &profile.target else {
+        return false;
+    };
+    if !proc::is_wine_process(pid) {
+        return false;
+    }
+    let Some(path) = proc::loader_pe_path(name, pid) else {
+        return false;
+    };
+    let Ok(path) = fs::canonicalize(&path) else {
+        return false;
+    };
+    let Ok(metadata) = fs::metadata(&path) else {
+        return false;
+    };
+    if profile
+        .preopen
+        .iter()
+        .any(|preopen| preopen.dev == metadata.dev() && preopen.ino == metadata.ino())
+    {
+        return false;
+    }
+    if fanotify_active(rt) {
+        let Some(fanotify) = &rt.fanotify else {
+            return false;
+        };
+        if let Err(err) = fanotify.add_open_mark(&path) {
+            warn!(
+                "fanotify PE mark profile={} path={} error={err:?}",
+                profile.id,
+                path.display()
+            );
+            return false;
+        }
+    }
+    let preopen = Preopen {
+        path: path.display().to_string(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        kind: TargetKind::Wine,
+        shared: false,
+    };
+    info!("learned PE profile={} path={}", profile.id, path.display());
+    profile.preopen.push(preopen);
+    profile.updated_at = now_rfc3339();
+    inner
+        .state
+        .profiles
+        .insert(profile.id.clone(), profile.clone());
+    true
 }
 
 fn attach_event(
@@ -1137,6 +1598,18 @@ fn attach_event(
         .map(|pids| pids.contains(&pid))
         .unwrap_or(false)
     {
+        if !inner
+            .marked
+            .get(&profile.id)
+            .is_some_and(|pids| pids.contains(&pid))
+        {
+            mark_sockets(&profile.id, profile.mark, pid);
+            inner
+                .marked
+                .entry(profile.id.clone())
+                .or_default()
+                .insert(pid);
+        }
         return true;
     }
     match cgroup::read_uid(pid) {
@@ -1145,6 +1618,20 @@ fn attach_event(
         Some(_) => match rt.cgroup.attach_pid(&profile.id, pid, source) {
             Ok(outcome) => {
                 inner.provenance.insert(outcome.tgid, source);
+                // A loader can already hold sockets (or inherit them) before
+                // the PE open gate fires; mark them like a late attach.
+                if !inner
+                    .marked
+                    .get(&profile.id)
+                    .is_some_and(|pids| pids.contains(&outcome.tgid))
+                {
+                    mark_sockets(&profile.id, profile.mark, outcome.tgid);
+                    inner
+                        .marked
+                        .entry(profile.id.clone())
+                        .or_default()
+                        .insert(outcome.tgid);
+                }
                 info!(
                     "attach profile={} pid={pid} source={}",
                     profile.id,
@@ -1204,7 +1691,7 @@ where
     }
 }
 
-async fn serve_connection(stream: UnixStream, rt: Arc<Rt>) {
+async fn serve_connection(stream: UnixStream, rt: Arc<Rt>, connection: u64) {
     let peer_uid = match stream.peer_cred() {
         Ok(cred) => cred.uid(),
         Err(err) => {
@@ -1283,7 +1770,7 @@ async fn serve_connection(stream: UnixStream, rt: Arc<Rt>) {
             }
         };
 
-        let response = handle_request(&rt, peer_uid, request).await;
+        let response = handle_request(&rt, peer_uid, connection, request).await;
         if write_response(&mut writer, &response).await.is_err() {
             break;
         }
@@ -1291,6 +1778,7 @@ async fn serve_connection(stream: UnixStream, rt: Arc<Rt>) {
             break;
         }
     }
+    release_connection(&rt, connection).await;
 }
 
 async fn write_response(
@@ -1307,7 +1795,12 @@ async fn write_response(
     writer.flush().await
 }
 
-async fn handle_request(rt: &Arc<Rt>, peer_uid: u32, request: Request) -> Response {
+async fn handle_request(
+    rt: &Arc<Rt>,
+    peer_uid: u32,
+    connection: u64,
+    request: Request,
+) -> Response {
     let id = request.id;
     match request.op {
         RequestOp::Status => match status_data(rt).await {
@@ -1344,6 +1837,552 @@ async fn handle_request(rt: &Arc<Rt>, peer_uid: u32, request: Request) -> Respon
             Ok(updated) => Response::ok(id, json!({ "updated": updated })),
             Err(err) => Response::err(id, err),
         },
+        RequestOp::Open(open) => match open_scope(rt, peer_uid, connection, open).await {
+            Ok(handle) => Response::ok(id, json!(handle)),
+            Err(err) => Response::err(id, err),
+        },
+        RequestOp::Close { profile, consumer } => {
+            match close_scope(rt, peer_uid, &profile, &consumer).await {
+                Ok(result) => Response::ok(id, json!(result)),
+                Err(err) => Response::err(id, err),
+            }
+        }
+        RequestOp::SetPolicy {
+            profile,
+            consumer,
+            policy,
+        } => match set_policy(rt, peer_uid, &profile, &consumer, policy).await {
+            Ok(status) => Response::ok(id, json!(status)),
+            Err(err) => Response::err(id, err),
+        },
+        RequestOp::ClearPolicy { profile, consumer } => {
+            match clear_policy(rt, peer_uid, &profile, &consumer).await {
+                Ok(status) => Response::ok(id, json!(status)),
+                Err(err) => Response::err(id, err),
+            }
+        }
+        RequestOp::Resolve {
+            profile,
+            target,
+            target_uid,
+        } => match resolve_scope(rt, profile.as_deref(), target.as_ref(), target_uid).await {
+            Ok(status) => Response::ok(id, json!(status)),
+            Err(err) => Response::err(id, err),
+        },
+    }
+}
+
+fn add_pe_preopen(profile: &mut Profile, path: &str) -> bool {
+    let Ok(path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(metadata) = fs::metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    if profile
+        .preopen
+        .iter()
+        .any(|preopen| preopen.dev == metadata.dev() && preopen.ino == metadata.ino())
+    {
+        return false;
+    }
+    // The mark is installed by apply_profile so a failed open cannot leave
+    // a PE hold behind.
+    profile.preopen.push(Preopen {
+        path: path.display().to_string(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        kind: TargetKind::Wine,
+        shared: false,
+    });
+    profile.updated_at = now_rfc3339();
+    true
+}
+
+fn loader_preopen() -> Vec<Preopen> {
+    let mut seen = std::collections::HashSet::new();
+    proc::wine_loader_files()
+        .into_iter()
+        .filter(|(_, dev, ino)| seen.insert((*dev, *ino)))
+        .map(|(path, dev, ino)| Preopen {
+            path: path.display().to_string(),
+            dev,
+            ino,
+            kind: TargetKind::Native,
+            shared: true,
+        })
+        .collect()
+}
+
+async fn open_scope(
+    rt: &Arc<Rt>,
+    peer_uid: u32,
+    connection: u64,
+    open: OpenScope,
+) -> Result<ScopeHandle, String> {
+    if !consumer_id_valid(&open.consumer) {
+        return Err(format!("invalid consumer `{}`", open.consumer));
+    }
+    if peer_uid != 0 && open.target_uid != peer_uid {
+        return Err("permission denied: target_uid must match your uid".to_string());
+    }
+    let target = resolve_target(&open.target)?;
+    let key = netscope_linux::types::ProfileKey::new(&target, open.target_uid);
+    // Discovery walks /proc and every Wine install; do it before taking the
+    // daemon lock so an open never stalls other clients.
+    let loader = if matches!(&target, Target::Name { .. }) {
+        loader_preopen()
+    } else {
+        Vec::new()
+    };
+
+    let mut inner = rt.inner.lock().await;
+    if rt.shutting_down.load(Ordering::SeqCst) {
+        return Err("daemon shutting down".to_string());
+    }
+
+    let existing = inner
+        .state
+        .profiles
+        .values()
+        .find(|profile| profile.key() == key)
+        .map(|profile| profile.id.clone());
+
+    if let Some(id) = existing {
+        let profile = inner
+            .state
+            .profiles
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("profile {id} vanished"))?;
+        require_owner(peer_uid, &profile)?;
+        let persistent = matches!(open.hold, Hold::Persistent)
+            || profile
+                .claims
+                .get(&open.consumer)
+                .is_some_and(|claim| matches!(claim.hold, Hold::Persistent));
+        let claim = if persistent {
+            Claim::persistent()
+        } else {
+            Claim::peer(connection)
+        };
+        let needs_preopen = matches!(profile.target, Target::Name { .. })
+            && !profile
+                .preopen
+                .iter()
+                .any(|preopen| preopen.kind == TargetKind::Native);
+        // A Name scope opened first still benefits from a PE hold when a
+        // consumer asks for the Wine path: the target stays name-matched and
+        // the next launch is caught before its first socket.
+        let strengthen_pe = match (&profile.target, &open.target) {
+            (Target::Name { .. }, TargetSpec::Wine { path }) => Some(path.clone()),
+            _ => None,
+        };
+        let before = profile.clone();
+        let profile = inner
+            .state
+            .profiles
+            .get_mut(&id)
+            .ok_or_else(|| format!("profile {id} vanished"))?;
+        if needs_preopen {
+            profile.preopen.extend(loader.clone());
+        }
+        if let Some(path) = strengthen_pe {
+            add_pe_preopen(profile, &path);
+        }
+        profile.claims.insert(open.consumer, claim);
+        profile.enabled = true;
+        profile.touch();
+        let profile = profile.clone();
+        if let Err(err) = apply_profile(rt, &profile) {
+            inner.state.profiles.insert(id.clone(), before.clone());
+            remove_loader_marks(rt, &inner, &profile);
+            restore_profile(rt, &inner, &before);
+            return Err(err);
+        }
+        if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
+            inner.state.profiles.insert(id.clone(), before.clone());
+            remove_loader_marks(rt, &inner, &profile);
+            restore_profile(rt, &inner, &before);
+            return Err(format!("state: write failed: {err}"));
+        }
+        attach_matches(rt, &mut inner);
+        return Ok(scope_handle(rt, &inner, &profile));
+    }
+
+    let id = match open.name {
+        Some(name) => {
+            if !profile_id_valid(&name) {
+                return Err(format!("invalid profile id `{name}`"));
+            }
+            if inner.state.profiles.contains_key(&name) {
+                return Err(format!("profile {name} already exists"));
+            }
+            name
+        }
+        None => allocate_profile_id(&inner.state, &key),
+    };
+    if inner.state.profiles.len() >= usize::from(rt.cfg.daemon.max_profiles) {
+        return Err(format!(
+            "profile limit reached ({})",
+            rt.cfg.daemon.max_profiles
+        ));
+    }
+    let index = ip::allocate_index(&inner.state.profiles, rt.cfg.daemon.max_profiles)
+        .map_err(|err| err.to_string())?;
+    let now = now_rfc3339();
+    let mut claims = BTreeMap::new();
+    let claim = if matches!(open.hold, Hold::Persistent) {
+        Claim::persistent()
+    } else {
+        Claim::peer(connection)
+    };
+    claims.insert(open.consumer, claim);
+    let preopen = if matches!(&target, Target::Name { .. }) {
+        loader
+    } else {
+        Vec::new()
+    };
+    let profile = Profile {
+        id: id.clone(),
+        target,
+        target_uid: open.target_uid,
+        owner_uid: peer_uid,
+        claims,
+        policies: BTreeMap::new(),
+        preopen,
+        index,
+        mark: mark(index),
+        table: table(index),
+        rule_priority: rule_priority(index),
+        enabled: true,
+        generation: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    if let Err(err) = apply_profile(rt, &profile) {
+        rollback_profile(rt, &inner, &profile);
+        return Err(err);
+    }
+    inner.state.profiles.insert(id, profile.clone());
+    if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
+        inner.state.profiles.remove(&profile.id);
+        rollback_profile(rt, &inner, &profile);
+        return Err(format!("state: write failed: {err}"));
+    }
+    inner.health.insert(profile.id.clone(), true);
+    attach_matches(rt, &mut inner);
+    Ok(scope_handle(rt, &inner, &profile))
+}
+
+fn allocate_profile_id(state: &State, key: &netscope_linux::types::ProfileKey) -> String {
+    let base = suggest_profile_id(key);
+    if !state.profiles.contains_key(&base) {
+        return base;
+    }
+    for suffix in 2..1000 {
+        let tail = format!("-{suffix}");
+        let keep = 32usize.saturating_sub(tail.len());
+        let stem = base.get(..keep).unwrap_or(&base).trim_end_matches('-');
+        let candidate = format!("{stem}{tail}");
+        if profile_id_valid(&candidate) && !state.profiles.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    let keep = 31usize;
+    let stem = base.get(..keep).unwrap_or(&base).trim_end_matches('-');
+    format!("{stem}-x")
+}
+
+async fn set_policy(
+    rt: &Arc<Rt>,
+    peer_uid: u32,
+    id: &str,
+    consumer: &str,
+    spec: PolicySpec,
+) -> Result<ProfileStatus, String> {
+    if !consumer_id_valid(consumer) {
+        return Err(format!("invalid consumer `{consumer}`"));
+    }
+    let policy = validate_mode(&spec)?;
+    let mut inner = rt.inner.lock().await;
+    if rt.shutting_down.load(Ordering::SeqCst) {
+        return Err("daemon shutting down".to_string());
+    }
+    let mut profile = inner
+        .state
+        .profiles
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("profile {id} not found"))?;
+    require_claim(peer_uid, &profile, consumer)?;
+    if matches!(policy, Policy::Route { .. }) {
+        if let Some((owner, _)) = profile.route_policy() {
+            if owner != consumer {
+                return Err(format!("route policy already owned by {owner}"));
+            }
+        }
+    }
+    let before = profile.clone();
+    let owns_route = profile
+        .route_policy()
+        .is_some_and(|(owner, _)| owner == consumer);
+    if matches!(policy, Policy::Route { .. }) && !before.has_route() {
+        if ip::table_in_use(profile.table).map_err(|err| err.to_string())? {
+            return Err(format!(
+                "table {} already in use by another program",
+                profile.table
+            ));
+        }
+    }
+    if (owns_route && before.has_route())
+        || (matches!(policy, Policy::Route { .. }) && !before.has_route())
+    {
+        let _ = ip::remove(&before);
+    }
+    let old = profile.policies.insert(consumer.to_string(), policy);
+    profile.touch();
+    if let Err(err) = apply_profile(rt, &profile) {
+        match old {
+            Some(old) => {
+                profile.policies.insert(consumer.to_string(), old);
+            }
+            None => {
+                profile.policies.remove(consumer);
+            }
+        }
+        restore_profile(rt, &inner, &profile);
+        return Err(err);
+    }
+    inner.state.profiles.insert(id.to_string(), profile.clone());
+    save_state(&rt.cfg.daemon.state_path, &inner.state)
+        .map_err(|err| format!("state: write failed: {err}"))?;
+    attach_matches(rt, &mut inner);
+    Ok(profile_status(rt, &inner, &profile))
+}
+
+async fn clear_policy(
+    rt: &Arc<Rt>,
+    peer_uid: u32,
+    id: &str,
+    consumer: &str,
+) -> Result<ProfileStatus, String> {
+    let mut inner = rt.inner.lock().await;
+    if rt.shutting_down.load(Ordering::SeqCst) {
+        return Err("daemon shutting down".to_string());
+    }
+    let mut profile = inner
+        .state
+        .profiles
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("profile {id} not found"))?;
+    require_claim(peer_uid, &profile, consumer)?;
+    if profile
+        .route_policy()
+        .is_some_and(|(owner, _)| owner == consumer)
+    {
+        let _ = ip::remove(&profile);
+    }
+    let before = profile.clone();
+    profile.policies.remove(consumer);
+    profile.touch();
+    if let Err(err) = apply_profile(rt, &profile) {
+        restore_profile(rt, &inner, &before);
+        return Err(err);
+    }
+    inner.state.profiles.insert(id.to_string(), profile.clone());
+    save_state(&rt.cfg.daemon.state_path, &inner.state)
+        .map_err(|err| format!("state: write failed: {err}"))?;
+    Ok(profile_status(rt, &inner, &profile))
+}
+
+async fn close_scope(
+    rt: &Arc<Rt>,
+    peer_uid: u32,
+    id: &str,
+    consumer: &str,
+) -> Result<CloseResult, String> {
+    let mut inner = rt.inner.lock().await;
+    if rt.shutting_down.load(Ordering::SeqCst) {
+        return Err("daemon shutting down".to_string());
+    }
+    let profile = inner
+        .state
+        .profiles
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("profile {id} not found"))?;
+    require_claim(peer_uid, &profile, consumer)?;
+    let mut profile = profile;
+    let before = profile.clone();
+    let had_route = profile.has_route();
+    profile.claims.remove(consumer);
+    profile.policies.remove(consumer);
+    profile.touch();
+    if had_route && !profile.has_route() {
+        let _ = ip::remove(&before);
+    }
+    if profile.claims.is_empty() {
+        teardown_profile(rt, &mut inner, &profile);
+        save_state(&rt.cfg.daemon.state_path, &inner.state)
+            .map_err(|err| format!("state: write failed: {err}"))?;
+        return Ok(CloseResult {
+            profile: id.to_string(),
+            released: true,
+            removed: true,
+            consumers: Vec::new(),
+        });
+    }
+    if let Err(err) = apply_profile(rt, &profile) {
+        restore_profile(rt, &inner, &before);
+        return Err(err);
+    }
+    let consumers = profile.claims.keys().cloned().collect();
+    inner.state.profiles.insert(id.to_string(), profile);
+    save_state(&rt.cfg.daemon.state_path, &inner.state)
+        .map_err(|err| format!("state: write failed: {err}"))?;
+    Ok(CloseResult {
+        profile: id.to_string(),
+        released: true,
+        removed: false,
+        consumers,
+    })
+}
+
+async fn release_connection(rt: &Rt, connection: u64) {
+    let mut inner = rt.inner.lock().await;
+    let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
+    let mut changed = false;
+    for id in ids {
+        let Some(profile) = inner.state.profiles.get(&id).cloned() else {
+            continue;
+        };
+        let consumers: Vec<String> = profile
+            .claims
+            .iter()
+            .filter(|(_, claim)| claim.connection == Some(connection))
+            .map(|(consumer, _)| consumer.clone())
+            .collect();
+        if consumers.is_empty() {
+            continue;
+        }
+        let mut profile = profile;
+        let before = profile.clone();
+        for consumer in consumers {
+            profile.claims.remove(&consumer);
+            profile.policies.remove(&consumer);
+        }
+        profile.touch();
+        if before.has_route() && !profile.has_route() {
+            let _ = ip::remove(&before);
+        }
+        if profile.claims.is_empty() {
+            teardown_profile(rt, &mut inner, &profile);
+        } else {
+            if let Err(err) = apply_profile(rt, &profile) {
+                warn!("release connection={connection} profile={id} error={err}");
+                continue;
+            }
+            inner.state.profiles.insert(id, profile);
+        }
+        changed = true;
+    }
+    if changed {
+        if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
+            warn!("state: write after peer release failed: {err}");
+        }
+        attach_matches(rt, &mut inner);
+    }
+}
+
+async fn resolve_scope(
+    rt: &Arc<Rt>,
+    id: Option<&str>,
+    target: Option<&TargetSpec>,
+    target_uid: Option<u32>,
+) -> Result<ProfileStatus, String> {
+    let inner = rt.inner.lock().await;
+    let profile = if let Some(id) = id {
+        inner
+            .state
+            .profiles
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("profile {id} not found"))?
+    } else if let Some(target) = target {
+        let uid = target_uid.ok_or_else(|| "target_uid is required with target".to_string())?;
+        let target = resolve_target(target)?;
+        let key = netscope_linux::types::ProfileKey::new(&target, uid);
+        inner
+            .state
+            .profiles
+            .values()
+            .find(|profile| profile.key() == key)
+            .cloned()
+            .ok_or_else(|| "no profile for target".to_string())?
+    } else {
+        return Err("resolve needs a profile id or target".to_string());
+    };
+    Ok(profile_status(rt, &inner, &profile))
+}
+
+fn require_claim(peer_uid: u32, profile: &Profile, consumer: &str) -> Result<(), String> {
+    require_owner(peer_uid, profile)?;
+    if profile.claims.contains_key(consumer) {
+        Ok(())
+    } else {
+        Err(format!(
+            "consumer {consumer} does not hold profile {}",
+            profile.id
+        ))
+    }
+}
+
+fn teardown_profile(rt: &Rt, inner: &mut Inner, profile: &Profile) {
+    remove_target_mark(rt, profile);
+    if let Err(err) = rt.nft.remove(profile) {
+        warn!("teardown profile={} nft error={err}", profile.id);
+    }
+    if profile.has_route() {
+        if let Err(err) = ip::remove(profile) {
+            warn!("teardown profile={} ip error={err}", profile.id);
+        }
+    }
+    let mut pids = rt.cgroup.procs(&profile.id).unwrap_or_default();
+    // A target that was moved out of the cgroup still carries the mark; the
+    // mark index is reused, so clear it from every pid we marked.
+    pids.extend(inner.marked.get(&profile.id).into_iter().flatten().copied());
+    pids.sort_unstable();
+    pids.dedup();
+    clear_socket_marks(&profile.id, profile.mark, &pids);
+    clear_all_marks(&profile.id, profile.mark);
+    if let Err(err) = rt.cgroup.remove(&profile.id) {
+        warn!("teardown profile={} cgroup error={err}", profile.id);
+    }
+    for pid in pids {
+        inner.provenance.remove(&pid);
+    }
+    inner.marked.remove(&profile.id);
+    inner.state.profiles.remove(&profile.id);
+    inner.health.remove(&profile.id);
+    remove_loader_marks(rt, inner, profile);
+}
+
+fn scope_handle(rt: &Rt, inner: &Inner, profile: &Profile) -> ScopeHandle {
+    let status = profile_status(rt, inner, profile);
+    ScopeHandle {
+        profile: status.id,
+        generation: status.generation,
+        target: status.target,
+        target_uid: profile.target_uid,
+        state: if status.enabled { "active" } else { "disabled" }.to_string(),
+        attached: status.attached,
+        pids: status.pids,
+        consumers: status.consumers,
     }
 }
 
@@ -1418,14 +2457,37 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         }
     }
     if matches!(&profile.target, Target::Name { .. }) {
-        warnings.push("name target attaches late; existing sockets are marked".to_string());
+        if fanotify_active(rt) && profile.preopen.iter().any(|p| p.kind == TargetKind::Native) {
+            warnings.push(
+                "name target: running processes attach late; new launches attach pre-exec"
+                    .to_string(),
+            );
+        } else if fanotify_active(rt) {
+            warnings.push(
+                "name target: no Wine launcher marks; new launches attach late, existing sockets are marked"
+                    .to_string(),
+            );
+        } else {
+            warnings.push("name target attaches late; existing sockets are marked".to_string());
+        }
     }
+    let policies: Vec<String> = profile
+        .policies
+        .iter()
+        .map(|(consumer, policy)| match policy {
+            Policy::Filter { .. } => format!("{consumer}:filter"),
+            Policy::Route { .. } => format!("{consumer}:route"),
+        })
+        .collect();
+    let mode = match profile.route_policy() {
+        Some(_) => "route",
+        None if profile.has_policies() => "filter",
+        None => "shared",
+    }
+    .to_string();
     ProfileStatus {
         id: profile.id.clone(),
-        mode: match &profile.mode {
-            Mode::Filter { .. } => "filter".to_string(),
-            Mode::Route { .. } => "route".to_string(),
-        },
+        mode,
         enabled: profile.enabled,
         target: match &profile.target {
             Target::Native { path, .. } => path.clone(),
@@ -1434,14 +2496,22 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
             Target::Steam { app_id } => format!("steam:{app_id}"),
         },
         cgroup: rt.cgroup.root().join(&profile.id).display().to_string(),
+        cgroup_level: rt.nft.level(),
         pids,
-        nft_table: format!("inet {}", table_name(&profile.mode, &profile.id)),
+        nft_table: if profile.has_policies() {
+            format!("inet {}", table_name(&profile.id))
+        } else {
+            String::new()
+        },
         mark: format!("0x{:x}", profile.mark),
         table: profile.table,
         rule_priority: profile.rule_priority,
         attached,
         healthy,
         warnings,
+        consumers: profile.claims.keys().cloned().collect(),
+        policies,
+        generation: profile.generation,
     }
 }
 
@@ -1459,8 +2529,13 @@ async fn add_profile(
     if peer_uid != 0 && add.target_uid != peer_uid {
         return Err("permission denied: target_uid must match your uid".to_string());
     }
-    let mode = validate_mode(&add.mode)?;
+    let policy = validate_mode(&add.mode)?;
     let target = resolve_target(&add.target)?;
+    let loader = if matches!(&target, Target::Name { .. }) {
+        loader_preopen()
+    } else {
+        Vec::new()
+    };
 
     let mut inner = rt.inner.lock().await;
     if rt.shutting_down.load(Ordering::SeqCst) {
@@ -1478,12 +2553,12 @@ async fn add_profile(
             rt.cfg.daemon.max_profiles
         ));
     }
-    if let Some(existing) = duplicate_target(&inner.state.profiles, &target) {
+    if let Some(existing) = duplicate_target(&inner.state.profiles, &target, add.target_uid) {
         return Err(format!("target already scoped by profile {existing}"));
     }
     let index = ip::allocate_index(&inner.state.profiles, rt.cfg.daemon.max_profiles)
         .map_err(|err| err.to_string())?;
-    if matches!(mode, Mode::Route { .. }) {
+    if matches!(policy, Policy::Route { .. }) {
         let route_table = table(index);
         if ip::table_in_use(route_table).map_err(|err| err.to_string())? {
             return Err(format!("table {route_table} already in use"));
@@ -1491,23 +2566,35 @@ async fn add_profile(
     }
 
     let now = now_rfc3339();
+    let mut claims = BTreeMap::new();
+    claims.insert("netscope-cli".to_string(), Claim::persistent());
+    let mut policies = BTreeMap::new();
+    policies.insert("netscope-cli".to_string(), policy);
+    let preopen = if matches!(&target, Target::Name { .. }) {
+        loader
+    } else {
+        Vec::new()
+    };
     let profile = Profile {
         id: add.name.clone(),
         target,
         target_uid: add.target_uid,
         owner_uid: peer_uid,
-        mode,
+        claims,
+        policies,
+        preopen,
         index,
         mark: mark(index),
         table: table(index),
         rule_priority: rule_priority(index),
         enabled: true,
+        generation: 0,
         created_at: now.clone(),
         updated_at: now,
     };
 
     if let Err(err) = apply_profile(rt, &profile) {
-        rollback_profile(rt, &profile);
+        rollback_profile(rt, &inner, &profile);
         return Err(err);
     }
     inner
@@ -1516,7 +2603,7 @@ async fn add_profile(
         .insert(profile.id.clone(), profile.clone());
     if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
         inner.state.profiles.remove(&profile.id);
-        rollback_profile(rt, &profile);
+        rollback_profile(rt, &inner, &profile);
         return Err(format!("state: write failed: {err}"));
     }
     inner.health.insert(profile.id.clone(), true);
@@ -1529,7 +2616,7 @@ fn apply_profile(rt: &Rt, profile: &Profile) -> Result<(), String> {
         .ensure_profile(&profile.id)
         .map_err(|err| err.to_string())?;
     rt.nft.apply(profile).map_err(|err| err.to_string())?;
-    if matches!(profile.mode, Mode::Route { .. }) {
+    if profile.has_route() {
         ip::ensure(profile).map_err(|err| err.to_string())?;
     }
     if fanotify_active(rt) {
@@ -1538,13 +2625,27 @@ fn apply_profile(rt: &Rt, profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
-fn rollback_profile(rt: &Rt, profile: &Profile) {
-    if matches!(profile.mode, Mode::Route { .. }) {
+fn rollback_profile(rt: &Rt, inner: &Inner, profile: &Profile) {
+    if profile.has_route() {
         let _ = ip::remove(profile);
     }
     let _ = rt.nft.remove(profile);
     remove_target_mark(rt, profile);
+    remove_loader_marks(rt, inner, profile);
+    let _ = rt.cgroup.drain(&profile.id);
     let _ = rt.cgroup.remove(&profile.id);
+}
+
+/// Re-apply a profile's previous state after a failed mutation so the kernel
+/// matches the state the caller is told is still in force.
+fn restore_profile(rt: &Rt, inner: &Inner, profile: &Profile) {
+    if profile.enabled {
+        if let Err(err) = apply_profile(rt, profile) {
+            warn!("restore profile={} error={err}", profile.id);
+        }
+    } else {
+        rollback_profile(rt, inner, profile);
+    }
 }
 
 fn add_target_mark(rt: &Rt, profile: &Profile) -> Result<(), FanotifyError> {
@@ -1555,7 +2656,27 @@ fn add_target_mark(rt: &Rt, profile: &Profile) -> Result<(), FanotifyError> {
         Target::Native { path, .. } => fanotify.add_exec_mark(Path::new(path)),
         Target::Wine { path, .. } => fanotify.add_open_mark(Path::new(path)),
         Target::Steam { .. } | Target::Name { .. } => Ok(()),
+    }?;
+    for preopen in &profile.preopen {
+        if !Path::new(&preopen.path).exists() {
+            continue;
+        }
+        let result = match preopen.kind {
+            netscope_linux::types::TargetKind::Native => {
+                fanotify.add_exec_mark(Path::new(&preopen.path))
+            }
+            netscope_linux::types::TargetKind::Wine => {
+                fanotify.add_open_mark(Path::new(&preopen.path))
+            }
+        };
+        if let Err(err) = result {
+            warn!(
+                "fanotify preopen mark profile={} path={} error={err:?}",
+                profile.id, preopen.path
+            );
+        }
     }
+    Ok(())
 }
 
 fn remove_target_mark(rt: &Rt, profile: &Profile) {
@@ -1569,6 +2690,34 @@ fn remove_target_mark(rt: &Rt, profile: &Profile) {
     };
     if let Err(err) = result {
         debug!("fanotify unmark profile={} error={err:?}", profile.id);
+    }
+}
+
+fn remove_loader_marks(rt: &Rt, inner: &Inner, profile: &Profile) {
+    let Some(fanotify) = &rt.fanotify else {
+        return;
+    };
+    for preopen in &profile.preopen {
+        let still_used = inner.state.profiles.values().any(|other| {
+            other.id != profile.id && other.preopen.iter().any(|entry| entry.path == preopen.path)
+        });
+        if still_used {
+            continue;
+        }
+        let result = match preopen.kind {
+            netscope_linux::types::TargetKind::Native => {
+                fanotify.remove_exec_mark(Path::new(&preopen.path))
+            }
+            netscope_linux::types::TargetKind::Wine => {
+                fanotify.remove_open_mark(Path::new(&preopen.path))
+            }
+        };
+        if let Err(err) = result {
+            debug!(
+                "fanotify unmark profile={} path={} error={err:?}",
+                profile.id, preopen.path
+            );
+        }
     }
 }
 
@@ -1597,22 +2746,27 @@ async fn remove_profile(rt: &Arc<Rt>, peer_uid: u32, id: &str) -> Result<(), Str
     if let Err(err) = rt.nft.remove(&profile) {
         warn!("remove profile={id} nft error={err}");
     }
-    if matches!(profile.mode, Mode::Route { .. }) {
+    if profile.has_route() {
         if let Err(err) = ip::remove(&profile) {
             warn!("remove profile={id} ip error={err}");
         }
     }
-    let pids = rt.cgroup.procs(id).unwrap_or_default();
+    let mut pids = rt.cgroup.procs(id).unwrap_or_default();
+    pids.extend(inner.marked.get(id).into_iter().flatten().copied());
+    pids.sort_unstable();
+    pids.dedup();
     clear_socket_marks(id, profile.mark, &pids);
+    clear_all_marks(id, profile.mark);
     if let Err(err) = rt.cgroup.remove(id) {
         warn!("remove profile={id} cgroup error={err}");
     }
     for pid in pids {
         inner.provenance.remove(&pid);
-        inner.marked.remove(&pid);
     }
+    inner.marked.remove(id);
     inner.state.profiles.remove(id);
     inner.health.remove(id);
+    remove_loader_marks(rt, &inner, &profile);
     save_state(&rt.cfg.daemon.state_path, &inner.state)
         .map_err(|err| format!("state: write failed: {err}"))?;
     Ok(())
@@ -1628,7 +2782,7 @@ async fn set_enabled(
     if rt.shutting_down.load(Ordering::SeqCst) {
         return Err("daemon shutting down".to_string());
     }
-    let profile = inner
+    let mut profile = inner
         .state
         .profiles
         .get(id)
@@ -1637,8 +2791,24 @@ async fn set_enabled(
     require_owner(peer_uid, &profile)?;
 
     if enabled {
+        // A profile created while fanotify was unavailable has no loader
+        // marks; add them now so a new launch still attaches pre-exec.
+        if fanotify_active(rt)
+            && matches!(profile.target, Target::Name { .. })
+            && !profile
+                .preopen
+                .iter()
+                .any(|preopen| preopen.kind == TargetKind::Native)
+        {
+            profile.preopen.extend(loader_preopen());
+            profile.updated_at = now_rfc3339();
+            if let Some(stored) = inner.state.profiles.get_mut(id) {
+                stored.preopen = profile.preopen.clone();
+                stored.updated_at = profile.updated_at.clone();
+            }
+        }
         if let Err(err) = apply_profile(rt, &profile) {
-            rollback_profile(rt, &profile);
+            rollback_profile(rt, &inner, &profile);
             return Err(err);
         }
         if let Some(stored) = inner.state.profiles.get_mut(id) {
@@ -1646,14 +2816,11 @@ async fn set_enabled(
             stored.updated_at = now_rfc3339();
         }
         if let Err(err) = save_state(&rt.cfg.daemon.state_path, &inner.state) {
-            remove_target_mark(rt, &profile);
-            let _ = rt.nft.remove(&profile);
-            if matches!(profile.mode, Mode::Route { .. }) {
-                let _ = ip::remove(&profile);
-            }
-            let _ = rt.cgroup.drain(id);
             if let Some(stored) = inner.state.profiles.get_mut(id) {
                 stored.enabled = false;
+            }
+            if let Err(disable_err) = reconcile_disabled(rt, &mut inner, &profile) {
+                warn!("disable after failed save profile={id} error={disable_err}");
             }
             return Err(format!("state: write failed: {err}"));
         }
@@ -1664,24 +2831,29 @@ async fn set_enabled(
         if let Err(err) = rt.nft.remove(&profile) {
             warn!("disable profile={id} nft error={err}");
         }
-        if matches!(profile.mode, Mode::Route { .. }) {
+        if profile.has_route() {
             if let Err(err) = ip::remove(&profile) {
                 warn!("disable profile={id} ip error={err}");
             }
         }
-        let pids = rt.cgroup.procs(id).unwrap_or_default();
+        let mut pids = rt.cgroup.procs(id).unwrap_or_default();
+        pids.extend(inner.marked.get(id).into_iter().flatten().copied());
+        pids.sort_unstable();
+        pids.dedup();
         if let Err(err) = rt.cgroup.drain(id) {
             warn!("disable profile={id} drain error={err}");
         }
         for pid in &pids {
             inner.provenance.remove(pid);
-            inner.marked.remove(pid);
         }
+        inner.marked.remove(id);
         clear_socket_marks(id, profile.mark, &pids);
+        clear_all_marks(id, profile.mark);
         if let Some(stored) = inner.state.profiles.get_mut(id) {
             stored.enabled = false;
             stored.updated_at = now_rfc3339();
         }
+        remove_loader_marks(rt, &inner, &profile);
         save_state(&rt.cfg.daemon.state_path, &inner.state)
             .map_err(|err| format!("state: write failed: {err}"))?;
         inner.health.insert(id.to_string(), true);
@@ -1720,9 +2892,9 @@ fn require_owner(peer_uid: u32, profile: &Profile) -> Result<(), String> {
     }
 }
 
-fn validate_mode(spec: &ModeSpec) -> Result<Mode, String> {
+fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
     match spec {
-        ModeSpec::Filter {
+        PolicySpec::Filter {
             default,
             allow_cidrs,
             deny_cidrs,
@@ -1752,17 +2924,18 @@ fn validate_mode(spec: &ModeSpec) -> Result<Mode, String> {
                 FilterDefault::Drop => allow_cidrs.clone(),
                 FilterDefault::Allow => deny_cidrs.clone(),
             };
-            Ok(Mode::Filter {
+            Ok(Policy::Filter {
                 default: *default,
                 exceptions,
             })
         }
-        ModeSpec::Route {
+        PolicySpec::Route {
             interface,
             gateway,
             gateway6,
             include_lan,
             allow_ipv6,
+            except,
         } => {
             if interface.is_empty()
                 || interface.contains('/')
@@ -1781,38 +2954,41 @@ fn validate_mode(spec: &ModeSpec) -> Result<Mode, String> {
                     .parse::<std::net::Ipv4Addr>()
                     .map_err(|_| format!("invalid IPv4 gateway {gateway}"))?;
             }
+            let mut normalized_gateway6 = None;
             if let Some(gateway6) = gateway6 {
                 if !*allow_ipv6 {
                     return Err("gateway6 requires allow_ipv6".to_string());
                 }
-                gateway6
+                let parsed = gateway6
                     .parse::<std::net::Ipv6Addr>()
                     .map_err(|_| format!("invalid IPv6 gateway {gateway6}"))?;
+                normalized_gateway6 = Some(parsed.to_string());
             }
-            Ok(Mode::Route {
+            if except.len() > 30 {
+                return Err("route policy accepts at most 30 exception networks".to_string());
+            }
+            let mut normalized = Vec::with_capacity(except.len());
+            for cidr in except {
+                let canonical = parse_cidr(cidr)?;
+                if !*allow_ipv6 && canonical.contains(':') {
+                    return Err(format!("route exception {cidr} needs allow_ipv6"));
+                }
+                normalized.push(canonical);
+            }
+            Ok(Policy::Route {
                 interface: interface.clone(),
                 gateway: gateway.clone(),
-                gateway6: gateway6.clone(),
+                gateway6: normalized_gateway6,
                 include_lan: *include_lan,
                 allow_ipv6: *allow_ipv6,
+                except: normalized,
             })
         }
     }
 }
 
-fn parse_cidr(text: &str) -> Result<(), String> {
-    let (address, prefix) = text
-        .split_once('/')
-        .ok_or_else(|| format!("invalid cidr {text}"))?;
-    let address: std::net::IpAddr = address
-        .parse()
-        .map_err(|_| format!("invalid cidr {text}"))?;
-    let prefix: u8 = prefix.parse().map_err(|_| format!("invalid cidr {text}"))?;
-    let max = if address.is_ipv4() { 32 } else { 128 };
-    if prefix > max {
-        return Err(format!("invalid cidr {text}"));
-    }
-    Ok(())
+fn parse_cidr(text: &str) -> Result<String, String> {
+    netscope_linux::ip::normalize_cidr(text)
 }
 
 fn resolve_target(spec: &TargetSpec) -> Result<Target, String> {
@@ -1830,8 +3006,16 @@ fn resolve_target(spec: &TargetSpec) -> Result<Target, String> {
             if name.len() > 64 || name.chars().any(|ch| ch.is_control()) {
                 return Err("process name must be at most 64 printable characters".to_string());
             }
-            let folded = name.to_lowercase();
-            let banned = ["netscope", "netscoped", "wineserver"];
+            let folded = netscope_linux::types::normalize_name(name);
+            let banned = [
+                "netscope",
+                "netscoped",
+                "wineserver",
+                "wine",
+                "wine64",
+                "wine-preloader",
+                "wine64-preloader",
+            ];
             if banned.contains(&folded.as_str()) {
                 return Err(format!(
                     "refusing to scope daemon or shared Wine process {name}"
@@ -1921,43 +3105,16 @@ fn reject_daemon_tool(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn duplicate_target(profiles: &BTreeMap<ProfileId, Profile>, target: &Target) -> Option<String> {
-    for profile in profiles.values() {
-        match (target, &profile.target) {
-            (
-                Target::Native { dev, ino, .. },
-                Target::Native {
-                    dev: existing_dev,
-                    ino: existing_ino,
-                    ..
-                },
-            ) if dev == existing_dev && ino == existing_ino => {
-                return Some(profile.id.clone());
-            }
-            (
-                Target::Wine { dev, ino, .. },
-                Target::Wine {
-                    dev: existing_dev,
-                    ino: existing_ino,
-                    ..
-                },
-            ) if dev == existing_dev && ino == existing_ino => {
-                return Some(profile.id.clone());
-            }
-            (Target::Steam { app_id }, Target::Steam { app_id: existing })
-                if app_id == existing =>
-            {
-                return Some(profile.id.clone());
-            }
-            (Target::Name { name }, Target::Name { name: existing })
-                if name.eq_ignore_ascii_case(existing) =>
-            {
-                return Some(profile.id.clone());
-            }
-            _ => {}
-        }
-    }
-    None
+fn duplicate_target(
+    profiles: &BTreeMap<ProfileId, Profile>,
+    target: &Target,
+    target_uid: u32,
+) -> Option<String> {
+    let key = netscope_linux::types::ProfileKey::new(target, target_uid);
+    profiles
+        .values()
+        .find(|profile| profile.key() == key)
+        .map(|profile| profile.id.clone())
 }
 
 fn cleanup_all(rt: &Rt, inner: &mut Inner) {
@@ -1966,7 +3123,7 @@ fn cleanup_all(rt: &Rt, inner: &mut Inner) {
         if let Err(err) = rt.nft.remove(profile) {
             warn!("cleanup profile={} nft error={err}", profile.id);
         }
-        if matches!(profile.mode, Mode::Route { .. }) {
+        if profile.has_route() {
             if let Err(err) = ip::remove(profile) {
                 warn!("cleanup profile={} ip error={err}", profile.id);
             }
@@ -1977,7 +3134,7 @@ fn cleanup_all(rt: &Rt, inner: &mut Inner) {
     }
     if let Ok(tables) = rt.nft.list_tables() {
         for name in tables {
-            if name.starts_with("netscope_filter_") || name.starts_with("netscope_route_") {
+            if name.starts_with("netscope_") {
                 let _ = run("nft", &["delete", "table", "inet", &name], None);
             }
         }
@@ -2022,6 +3179,86 @@ mod tests {
         assert_eq!(cfg.daemon.socket_path, PathBuf::from("/tmp/netscope.sock"));
         assert_eq!(cfg.daemon.poll_interval_ms, 1000);
         assert_eq!(cfg.daemon.max_profiles, 32);
+    }
+
+    #[test]
+    fn v1_state_becomes_a_persistent_cli_claim() {
+        let path = std::env::temp_dir().join(format!("netscope-state-v1-{}", std::process::id()));
+        let state = serde_json::json!({
+            "version": 1,
+            "profiles": {
+                "game": {
+                    "id": "game",
+                    "target": {"kind": "name", "name": "Overwatch.exe"},
+                    "target_uid": 1000,
+                    "owner_uid": 1000,
+                    "mode": {"kind": "filter", "default": "drop", "exceptions": []},
+                    "index": 0,
+                    "mark": mark(0),
+                    "table": table(0),
+                    "rule_priority": 1000,
+                    "enabled": true,
+                    "created_at": now_rfc3339(),
+                    "updated_at": now_rfc3339()
+                }
+            }
+        });
+        std::fs::write(&path, state.to_string()).unwrap();
+        let loaded = load_state(&path).unwrap();
+        let profile = loaded.profiles.get("game").unwrap();
+        assert_eq!(
+            profile.claims.get("netscope-cli").unwrap().hold,
+            Hold::Persistent
+        );
+        assert!(matches!(
+            profile.policies.get("netscope-cli"),
+            Some(Policy::Filter {
+                default: FilterDefault::Drop,
+                ..
+            })
+        ));
+        assert_eq!(profile.rule_priority, rule_priority(0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v2_peer_claims_do_not_survive_a_restart() {
+        let path = std::env::temp_dir().join(format!("netscope-state-peer-{}", std::process::id()));
+        let state = serde_json::json!({
+            "version": 2,
+            "profiles": {
+                "game": {
+                    "id": "game",
+                    "target": {"kind": "name", "name": "Overwatch.exe"},
+                    "target_uid": 1000,
+                    "owner_uid": 1000,
+                    "claims": {
+                        "exitlink": {"hold": "peer"},
+                        "dropship": {"hold": "persistent"}
+                    },
+                    "policies": {
+                        "exitlink": {"kind": "route", "interface": "tun0", "gateway": null, "gateway6": null, "include_lan": false, "allow_ipv6": false, "except": []},
+                        "dropship": {"kind": "filter", "default": "drop", "exceptions": []}
+                    },
+                    "preopen": [],
+                    "index": 0,
+                    "mark": mark(0),
+                    "table": table(0),
+                    "rule_priority": rule_priority(0),
+                    "enabled": true,
+                    "generation": 1,
+                    "created_at": now_rfc3339(),
+                    "updated_at": now_rfc3339()
+                }
+            }
+        });
+        std::fs::write(&path, state.to_string()).unwrap();
+        let loaded = load_state(&path).unwrap();
+        let profile = loaded.profiles.get("game").unwrap();
+        assert!(profile.claims.contains_key("dropship"));
+        assert!(!profile.claims.contains_key("exitlink"));
+        assert!(!profile.policies.contains_key("exitlink"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -97,7 +97,7 @@ body:
         - Filter (drop)
         - Filter (allow)
         - Route
-        - More than one mode
+        - Shared (filter and route)
         - Not sure
     validations:
       required: true

@@ -11,8 +11,9 @@ Most Linux VPN and proxy tools route the whole machine or require a wrapper. net
 ## What it does
 
 - **Normally launched apps.** `fanotify` catches `exec` and places the process in its profile cgroup before the first socket.
-- **Running apps by name.** A `--process` target attaches a process by `comm` or argv basename, with no install path and no wrapper; attachment is late and existing sockets keep their old route.
+- **Running apps by name.** A `--process` target attaches a process by `comm` or executable basename, with no install path and no wrapper. A new Wine/Proton launch is caught by the loader hold; an already-running process attaches on the poll, and its existing sockets are marked so they follow the profile.
 - **Per-app cgroup identity.** nftables matches `socket cgroupv2`, not a process name that can be spoofed.
+- **Shared process scopes.** Two tools can name the same target and share one profile and cgroup, each with its own policy; a scope carries one route policy and any number of filters. The last consumer to close removes the scope.
 - **Blackhole fallback while active.** Route profiles use a dedicated table with a blackhole default. If the tunnel interface is down, traffic fails rather than leaking. Daemon death or table removal is fail-open; the docs say so.
 
 ## Quick start

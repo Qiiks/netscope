@@ -17,6 +17,7 @@ The interface must already exist and be up. If it does not, the daemon fails to 
 | `--gateway6 <ipv6>` | IPv6 next hop. Only valid with `--allow-ipv6`. |
 | `--include-lan` | Route LAN destinations through the tunnel instead of bypassing them. |
 | `--allow-ipv6` | Carry IPv6 through the profile. Without it, all IPv6 from the profile is dropped. |
+| `--except <cidr>` | Destination that stays direct. Repeatable, up to 30. The daemon installs an `ip rule` to `main` at a lower priority than the mark rule. Loopback is always kept direct the same way and does not count against the 30. |
 
 `--gateway` and `--gateway6` are mutually exclusive with the wrong family: `--gateway6` requires `--allow-ipv6`, and `--gateway` is IPv4 only.
 
@@ -43,6 +44,14 @@ The table contains two defaults:
 | `blackhole default` | 1000 | Used when the real route is gone, so traffic fails instead of falling back to the main table. |
 
 The mark and table values come from the profile index. Table `20000` and mark `0x4e53` are the first profile; the next profile uses `20001` and `0x4e54`, up to 32 profiles.
+
+Each `--except` adds a rule just above the mark rule:
+
+```text
+fwmark 0x4e53 to 203.0.113.0/24 table main pref 999
+```
+
+A packet from the profile to an excepted destination matches that rule first and uses the main table; everything else reaches the mark rule and uses the profile table. Exceptions are removed with the profile.
 
 ## LAN bypass
 
@@ -107,12 +116,21 @@ peer stay as they were, and only the path changes. If a descriptor could not be
 marked, the daemon logs `mark profile=... error=...`; restart the application
 to cover that socket.
 
+## Interaction with filter mode
+
+A shared profile can carry one route policy and several filter policies. Each
+filter runs before the route mark. A destination dropped by any filter is never
+routed; an accepted destination is marked and follows this route. A second
+consumer asking for a route on a profile that already has one gets an error;
+route ownership moves only when the owning consumer replaces its own policy.
+See [Shared scopes](../shared-scopes.md).
+
 ## Inspect the routing state
 
 ```sh
 ip rule show
 ip route show table 20000
-nft list table inet netscope_route_routed
+nft list table inet netscope_routed
 ```
 
 Mark and table are allocated by profile index: the first profile uses mark `0x4e53` and table `20000`, and each additional profile takes the next free index. `netscope status --json` reports each profile's `mark`, `table`, and `nft_table`; `ip rule show` maps a mark to its table.

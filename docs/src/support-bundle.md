@@ -120,7 +120,7 @@ Attach the `.tar.zst` file to the bug report. Include:
 
 - the exact command that failed, copied verbatim;
 - what you expected and what happened;
-- whether the profile used filter or route mode;
+- which consumers and policies the profile carried, and whether it routed or filtered;
 - whether the app was already running when the profile was added.
 
 The [bug report form](https://github.com/Qiiks/netscope/issues/new?template=bug.yml) asks for these. For a security issue, do not attach the bundle to a public issue; use the private advisory link in [Security](security.md).

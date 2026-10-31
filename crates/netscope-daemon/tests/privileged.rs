@@ -23,10 +23,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use netscope_linux::protocol::{
-    AddProfile, ProfileStatus, Request, RequestOp, Response, StatusData,
+    AddProfile, CloseResult, OpenScope, ProfileStatus, Request, RequestOp, Response, ScopeHandle,
+    StatusData,
 };
 use netscope_linux::sockets;
-use netscope_linux::types::{FilterDefault, ModeSpec, TargetSpec};
+use netscope_linux::types::{FilterDefault, Hold, ModeSpec, PolicySpec, TargetSpec};
 use serde_json::Value;
 
 /// Serialise test bodies even if the operator forgets `--test-threads=1`.
@@ -92,6 +93,28 @@ impl Client {
             target_uid,
         })));
         serde_json::from_value(data).expect("add response shape")
+    }
+
+    fn open(&mut self, scope: OpenScope) -> ScopeHandle {
+        let data = ok_data(self.call(RequestOp::Open(scope)));
+        serde_json::from_value(data).expect("open response shape")
+    }
+
+    fn set_policy(&mut self, profile: &str, consumer: &str, policy: PolicySpec) -> ProfileStatus {
+        let data = ok_data(self.call(RequestOp::SetPolicy {
+            profile: profile.to_string(),
+            consumer: consumer.to_string(),
+            policy,
+        }));
+        serde_json::from_value(data).expect("policy response shape")
+    }
+
+    fn close(&mut self, profile: &str, consumer: &str) -> CloseResult {
+        let data = ok_data(self.call(RequestOp::Close {
+            profile: profile.to_string(),
+            consumer: consumer.to_string(),
+        }));
+        serde_json::from_value(data).expect("close response shape")
     }
 
     fn list(&mut self) -> Vec<ProfileStatus> {
@@ -994,6 +1017,7 @@ fn route_mark_table_blackhole() {
             gateway6: None,
             include_lan: false,
             allow_ipv6: false,
+            except: Vec::new(),
         },
         0,
     );
@@ -1050,6 +1074,94 @@ fn route_mark_table_blackhole() {
         !nft_tables().contains(&table),
         "nft table {table} survived remove"
     );
+}
+
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn shared_scope_composes_filter_and_route_for_two_consumers() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    preflight();
+    let mut daemon = Daemon::new("shared");
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let dummy = format!("nss{}", pid % 100000);
+    run_ip(&["link", "add", dummy.as_str(), "type", "dummy"]);
+    daemon.track_link(&dummy);
+    run_ip(&["link", "set", dummy.as_str(), "up"]);
+
+    let id = format!("shared-{pid}");
+    let target = TargetSpec::Name {
+        name: "shared-game.exe".to_string(),
+    };
+    let first = client.open(OpenScope {
+        consumer: "dropship".to_string(),
+        target: target.clone(),
+        target_uid: 0,
+        name: Some(id.clone()),
+        hold: Hold::Persistent,
+    });
+    let filter = client.set_policy(
+        &id,
+        "dropship",
+        PolicySpec::Filter {
+            default: FilterDefault::Drop,
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+        },
+    );
+    assert_eq!(filter.mode, "filter");
+
+    let second = client.open(OpenScope {
+        consumer: "exitlink".to_string(),
+        target,
+        target_uid: 0,
+        name: None,
+        hold: Hold::Peer,
+    });
+    assert_eq!(second.profile, id, "same target must share one profile");
+    let route = client.set_policy(
+        &id,
+        "exitlink",
+        PolicySpec::Route {
+            interface: dummy.clone(),
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+            except: Vec::new(),
+        },
+    );
+    daemon.track_profile(&id, &route);
+    assert_eq!(route.consumers.len(), 2);
+    assert_eq!(route.policies.len(), 2);
+    assert_eq!(route.mode, "route");
+    let table = table_name_from_status(&route);
+    let body = run_cmd("nft", &["list", "table", "inet", table.as_str()]);
+    let drop_at = body.find("drop").expect("filter rule");
+    let mark_at = body.find("meta mark set").expect("route rule");
+    assert!(drop_at < mark_at, "filter must run before route: {body}");
+    assert!(body.contains("socket cgroupv2"), "cgroup selector missing");
+    assert!(body.contains("socket mark"), "late-socket selector missing");
+
+    let released = client.close(&id, "dropship");
+    assert!(!released.removed);
+    assert_eq!(released.consumers, vec!["exitlink".to_string()]);
+    let body = run_cmd("nft", &["list", "table", "inet", table.as_str()]);
+    assert!(
+        !body.contains("counter drop"),
+        "filter survived close: {body}"
+    );
+    assert!(
+        body.contains("meta mark set"),
+        "route lost with filter: {body}"
+    );
+
+    let released = client.close(&id, "exitlink");
+    assert!(released.removed);
+    assert!(!nft_tables().contains(&table), "table survived last close");
+    assert!(!daemon.cgroup_root.join(&id).exists(), "cgroup survived");
 }
 
 #[test]
@@ -1117,6 +1229,7 @@ fn late_socket_mark_routes_existing_socket() {
             gateway6: None,
             include_lan: false,
             allow_ipv6: false,
+            except: Vec::new(),
         },
         0,
     );
@@ -1270,6 +1383,7 @@ fn restart_reconcile_and_cleanup() {
             gateway6: None,
             include_lan: false,
             allow_ipv6: false,
+            except: Vec::new(),
         },
         0,
     );

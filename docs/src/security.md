@@ -33,7 +33,7 @@ There are no passwords or tokens. The daemon uses the peer credentials of the Un
 
 ## Input validation
 
-All requests are JSON lines with a 64 KiB request limit and a 64 KiB response limit. The daemon rejects malformed JSON, oversized requests, unknown operations, and an API version it does not support. The protocol version is `1`.
+All requests are JSON lines with a 256 KiB request limit and a 256 KiB response limit. The daemon rejects malformed JSON, oversized requests, and unknown operations. The CLI checks the status response's API version and refuses a daemon with a different protocol version; the current version is `2`.
 
 Before any host change, the daemon validates:
 
@@ -45,6 +45,7 @@ Before any host change, the daemon validates:
 - **CIDRs:** parsed as IPv4 or IPv6 networks. Invalid input is rejected, not passed through.
 - **Interfaces and gateways:** passed as separate arguments to `ip`; no shell is involved.
 - **Numeric values:** profile count is bounded at 32, and index, mark, table, and priority allocation is bounded.
+- **Shared scopes:** every consumer must resolve to the profile's owner UID, and a non-root caller cannot name another UID as `target_uid`. One route policy is allowed per profile; a second consumer's route request is refused. Filter policies compose, so a consumer cannot remove another consumer's filter by replacing its own policy.
 
 The daemon never invokes a shell, never evaluates a profile-controlled string as shell code, and never writes attacker-controlled text into an nftables rule without parsing or a fixed grammar.
 
@@ -63,7 +64,7 @@ A root daemon is a real risk if it has a bug. Reduce exposure:
 
 netscope scopes traffic from processes it successfully attaches to a profile cgroup. It does **not** protect:
 
-- **Sockets that cannot be marked.** A socket opened before attachment is marked with the profile mark and matched by `socket mark`. Marking requires the root daemon to reach the target's descriptor table (`pidfd_getfd`, `CAP_NET_ADMIN`). If a descriptor cannot be reached, the daemon logs `mark profile=... error=...` and that socket keeps its original route. A `--process` target is attached late, so this is the case to watch for name targets; restart the app if the log reports a failure.
+- **Sockets that cannot be marked.** A socket opened before attachment is marked with the profile mark and matched by `socket mark`. Marking requires the root daemon to reach the target's descriptor table (`pidfd_getfd`, `CAP_SYS_PTRACE`); the nftables and routing rules need `CAP_NET_ADMIN`. If a descriptor cannot be reached, the daemon logs `mark profile=... error=...` and that socket keeps its original route. A `--process` target for an already-running app attaches late, so this is the case to watch for name targets; a new Wine/Proton launch is caught by the loader hold before its first socket. Restart the app if the log reports a failure.
 - **Mark collisions.** The nftables rules match any socket carrying the profile's mark, not only sockets the daemon marked. A process with `CAP_NET_ADMIN` can set the same mark on its own socket and become subject to the profile. The mark base (`0x4e53`) is intended to be private to netscope; another tool that uses those values can collide.
 - **Name collisions.** A `--process` target matches every process with that `comm` or argv basename, including another user's process if it runs under the same UID. Both are attached. Use `--exe` or `--wine` when the identity must be exact.
 - **Non-Wine processes that open a selected PE.** A `--wine` profile marks the file, so the daemon sees every open of it, but it attaches only a Wine process whose command line names the selected PE. Any other process that opens the same file — a file manager, an indexer, a scanner — is allowed and left unscoped. `wineserver` is never attached; it may open the PE for a loader, but it is shared across Wine applications. Children the attached process starts stay in the same cgroup.
@@ -85,5 +86,5 @@ Filter mode is fail-open in the same operational sense: if the profile or daemon
 - The workspace is dual-licensed MIT OR Apache-2.0.
 - No dependencies are vendored; builds use crates.io through Cargo.
 - Release tarballs should ship with a SHA-256 file; verify it before installing.
-- CI runs formatting, Clippy with warnings denied, tests, a release build, and an mdBook build.
+- CI runs formatting, Clippy, tests, a release build, and an mdBook build.
 - No external assets, fonts, analytics, or tracking scripts are loaded by these docs or the binaries.

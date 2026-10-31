@@ -2,7 +2,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use netscope_linux::protocol::{AddProfile, ProfileStatus, RequestOp, StatusData, API_VERSION};
+use netscope_linux::protocol::{
+    AddProfile, CloseResult, OpenScope, ProfileStatus, RequestOp, ScopeHandle, StatusData,
+    API_VERSION,
+};
 use netscope_linux::types::{profile_id_valid, FilterDefault, ModeSpec, ProfileId, TargetSpec};
 use serde_json::Value;
 
@@ -19,6 +22,7 @@ pub struct AddInput {
     pub route: Option<String>,
     pub allow_cidrs: Vec<String>,
     pub deny_cidrs: Vec<String>,
+    pub except_cidrs: Vec<String>,
     pub gateway: Option<String>,
     pub gateway6: Option<String>,
     pub include_lan: bool,
@@ -31,6 +35,7 @@ pub struct ModeInput<'a> {
     pub route: Option<&'a str>,
     pub allow_cidrs: &'a [String],
     pub deny_cidrs: &'a [String],
+    pub except_cidrs: &'a [String],
     pub gateway: Option<&'a str>,
     pub gateway6: Option<&'a str>,
     pub include_lan: bool,
@@ -47,9 +52,8 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     }
 }
 
-pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
-    validate_name(&input.name)?;
-    let target = match (
+pub fn build_target(input: &AddInput) -> Result<TargetSpec, String> {
+    match (
         input.exe.as_deref(),
         input.wine.as_deref(),
         input.process.as_deref(),
@@ -61,9 +65,9 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
             let path = path
                 .to_str()
                 .ok_or_else(|| "--exe path is not valid UTF-8".to_string())?;
-            TargetSpec::Native {
+            Ok(TargetSpec::Native {
                 path: path.to_string(),
-            }
+            })
         }
         (None, Some(path), None, None) => {
             let path = std::fs::canonicalize(path)
@@ -71,9 +75,9 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
             let path = path
                 .to_str()
                 .ok_or_else(|| "--wine path is not valid UTF-8".to_string())?;
-            TargetSpec::Wine {
+            Ok(TargetSpec::Wine {
                 path: path.to_string(),
-            }
+            })
         }
         (None, None, Some(name), None) => {
             let name = name.trim();
@@ -86,27 +90,29 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
                         .to_string(),
                 );
             }
-            TargetSpec::Name {
+            Ok(TargetSpec::Name {
                 name: name.to_string(),
-            }
+            })
         }
         (None, None, None, Some(app_id)) => {
             if app_id == 0 {
                 return Err("--steam app id must be greater than zero".to_string());
             }
-            TargetSpec::Steam { app_id }
+            Ok(TargetSpec::Steam { app_id })
         }
-        _ => {
-            return Err(
-                "exactly one of --exe, --wine, --process, or --steam is required".to_string(),
-            );
-        }
-    };
+        _ => Err("exactly one of --exe, --wine, --process, or --steam is required".to_string()),
+    }
+}
+
+pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
+    validate_name(&input.name)?;
+    let target = build_target(&input)?;
     let mode = validate_mode(ModeInput {
         filter: input.filter.as_deref(),
         route: input.route.as_deref(),
         allow_cidrs: &input.allow_cidrs,
         deny_cidrs: &input.deny_cidrs,
+        except_cidrs: &input.except_cidrs,
         gateway: input.gateway.as_deref(),
         gateway6: input.gateway6.as_deref(),
         include_lan: input.include_lan,
@@ -192,12 +198,14 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
                     return Err("--gateway6 requires --allow-ipv6".to_string());
                 }
             }
+            validate_cidrs(input.except_cidrs)?;
             Ok(ModeSpec::Route {
                 interface: interface.to_string(),
                 gateway: input.gateway.map(str::to_string),
                 gateway6: input.gateway6.map(str::to_string),
                 include_lan: input.include_lan,
                 allow_ipv6: input.allow_ipv6,
+                except: input.except_cidrs.to_vec(),
             })
         }
     }
@@ -310,6 +318,156 @@ pub fn add(socket: &Path, profile: AddProfile) -> i32 {
     }
 }
 
+pub fn open(socket: &Path, scope: OpenScope, policy: Option<ModeSpec>) -> i32 {
+    let consumer = scope.consumer.clone();
+    let handle = match client::send(socket, RequestOp::Open(scope)) {
+        Ok(Some(data)) => match serde_json::from_value::<ScopeHandle>(data) {
+            Ok(handle) => handle,
+            Err(err) => {
+                return fail(ClientError::Protocol(format!(
+                    "invalid open response: {err}"
+                )));
+            }
+        },
+        Ok(None) => {
+            return fail(ClientError::Protocol(
+                "daemon returned no scope".to_string(),
+            ))
+        }
+        Err(err) => return fail(err),
+    };
+    if let Some(policy) = policy {
+        let result = client::send(
+            socket,
+            RequestOp::SetPolicy {
+                profile: handle.profile.clone(),
+                consumer: consumer.clone(),
+                policy,
+            },
+        );
+        let failure = match result {
+            Ok(Some(data)) => match serde_json::from_value::<ProfileStatus>(data) {
+                Ok(status) => {
+                    print_profiles(std::slice::from_ref(&status));
+                    None
+                }
+                Err(err) => Some(ClientError::Protocol(format!(
+                    "invalid policy response: {err}"
+                ))),
+            },
+            Ok(None) => Some(ClientError::Protocol(
+                "daemon returned no policy".to_string(),
+            )),
+            Err(err) => Some(err),
+        };
+        if let Some(err) = failure {
+            // The claim was created by this one-shot command; release it so a
+            // failed policy does not leave an empty scope behind.
+            let _ = client::send(
+                socket,
+                RequestOp::Close {
+                    profile: handle.profile.clone(),
+                    consumer,
+                },
+            );
+            return fail(err);
+        }
+    }
+    println!(
+        "opened {} consumers={} state={} attached={} pids={}",
+        handle.profile,
+        handle.consumers.join(","),
+        handle.state,
+        handle.attached,
+        handle
+            .pids
+            .iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    0
+}
+
+pub fn set_policy(socket: &Path, profile: String, consumer: String, policy: ModeSpec) -> i32 {
+    match client::send(
+        socket,
+        RequestOp::SetPolicy {
+            profile,
+            consumer,
+            policy,
+        },
+    ) {
+        Ok(Some(data)) => match serde_json::from_value::<ProfileStatus>(data) {
+            Ok(status) => {
+                print_profiles(std::slice::from_ref(&status));
+                0
+            }
+            Err(err) => fail(ClientError::Protocol(format!(
+                "invalid policy response: {err}"
+            ))),
+        },
+        Ok(None) => fail(ClientError::Protocol(
+            "daemon returned no policy".to_string(),
+        )),
+        Err(err) => fail(err),
+    }
+}
+
+pub fn close(socket: &Path, profile: String, consumer: String) -> i32 {
+    match client::send(socket, RequestOp::Close { profile, consumer }) {
+        Ok(Some(data)) => match serde_json::from_value::<CloseResult>(data) {
+            Ok(result) => {
+                println!(
+                    "closed {} consumer released={} scope_removed={} consumers={}",
+                    result.profile,
+                    result.released,
+                    result.removed,
+                    result.consumers.join(",")
+                );
+                0
+            }
+            Err(err) => fail(ClientError::Protocol(format!(
+                "invalid close response: {err}"
+            ))),
+        },
+        Ok(None) => fail(ClientError::Protocol(
+            "daemon returned no close result".to_string(),
+        )),
+        Err(err) => fail(err),
+    }
+}
+
+pub fn resolve(
+    socket: &Path,
+    profile: Option<String>,
+    target: Option<TargetSpec>,
+    uid: u32,
+) -> i32 {
+    match client::send(
+        socket,
+        RequestOp::Resolve {
+            profile,
+            target,
+            target_uid: Some(uid),
+        },
+    ) {
+        Ok(Some(data)) => match serde_json::from_value::<ProfileStatus>(data) {
+            Ok(status) => {
+                print_profiles(std::slice::from_ref(&status));
+                0
+            }
+            Err(err) => fail(ClientError::Protocol(format!(
+                "invalid resolve response: {err}"
+            ))),
+        },
+        Ok(None) => fail(ClientError::Protocol(
+            "daemon returned no profile".to_string(),
+        )),
+        Err(err) => fail(err),
+    }
+}
+
 pub fn remove(socket: &Path, id: ProfileId) -> i32 {
     let message = format!("removed {id}");
     simple(socket, RequestOp::Remove { name: id }, message)
@@ -391,15 +549,19 @@ fn print_profiles(profiles: &[ProfileStatus]) {
     let mut mode_width = "MODE".len();
     let mut target_width = "TARGET".len();
     let mut attached_width = "ATTACHED".len();
+    let mut consumers_width = "CONSUMERS".len();
+    let mut policies_width = "POLICIES".len();
     for profile in profiles {
         name_width = name_width.max(profile.id.len());
         mode_width = mode_width.max(profile.mode.len());
         target_width = target_width.max(profile.target.len());
         attached_width = attached_width.max(profile.attached.len());
+        consumers_width = consumers_width.max(profile.consumers.join(",").len());
+        policies_width = policies_width.max(profile.policies.join(",").len());
     }
     println!(
-        "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  PIDS",
-        "NAME", "MODE", "ENABLED", "TARGET", "ATTACHED"
+        "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  PIDS",
+        "NAME", "MODE", "ENABLED", "TARGET", "ATTACHED", "CONSUMERS", "POLICIES"
     );
     for profile in profiles {
         let enabled = if profile.enabled { "yes" } else { "no" };
@@ -410,8 +572,14 @@ fn print_profiles(profiles: &[ProfileStatus]) {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {pids}",
-            profile.id, profile.mode, enabled, profile.target, profile.attached
+            "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  {pids}",
+            profile.id,
+            profile.mode,
+            enabled,
+            profile.target,
+            profile.attached,
+            profile.consumers.join(","),
+            profile.policies.join(",")
         );
     }
 }
@@ -452,6 +620,7 @@ mod tests {
             route: None,
             allow_cidrs: &allow,
             deny_cidrs: &[],
+            except_cidrs: &[],
             gateway: None,
             gateway6: None,
             include_lan: false,
@@ -471,6 +640,7 @@ mod tests {
             route: None,
             allow_cidrs: &[],
             deny_cidrs: &allow,
+            except_cidrs: &[],
             gateway: None,
             gateway6: None,
             include_lan: false,
@@ -488,6 +658,7 @@ mod tests {
             route: None,
             allow_cidrs: &[],
             deny_cidrs: &deny,
+            except_cidrs: &[],
             gateway: None,
             gateway6: None,
             include_lan: false,
@@ -499,6 +670,7 @@ mod tests {
             route: None,
             allow_cidrs: &[],
             deny_cidrs: &[],
+            except_cidrs: &[],
             gateway: None,
             gateway6: None,
             include_lan: false,
@@ -514,6 +686,7 @@ mod tests {
             route: None,
             allow_cidrs: &[],
             deny_cidrs: &[],
+            except_cidrs: &[],
             gateway: Some("192.0.2.1"),
             gateway6: None,
             include_lan: false,
@@ -526,6 +699,7 @@ mod tests {
             route: Some("tun0"),
             allow_cidrs: &[],
             deny_cidrs: &[],
+            except_cidrs: &[],
             gateway: Some("192.0.2.1"),
             gateway6: Some("2001:db8::1"),
             include_lan: false,

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use netscope_linux::cgroup::{AttachSource, CgroupManager};
 use netscope_linux::nft::NftManager;
-use netscope_linux::types::{FilterDefault, Mode, Profile, Target};
+use netscope_linux::types::{Claim, FilterDefault, Policy, Profile, Target};
 
 fn main() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
@@ -41,15 +41,22 @@ fn main() -> Result<()> {
         },
         target_uid: unsafe { libc::geteuid() },
         owner_uid: unsafe { libc::geteuid() },
-        mode: Mode::Filter {
-            default: FilterDefault::Drop,
-            exceptions: vec![],
-        },
+        claims: [("netscope-cli".to_string(), Claim::persistent())].into(),
+        policies: [(
+            "netscope-cli".to_string(),
+            Policy::Filter {
+                default: FilterDefault::Drop,
+                exceptions: vec![],
+            },
+        )]
+        .into(),
+        preopen: Vec::new(),
         index: 0,
         mark: netscope_linux::types::mark(0),
         table: netscope_linux::types::table(0),
         rule_priority: netscope_linux::types::rule_priority(0),
         enabled: true,
+        generation: 0,
         created_at: "2026-10-30T00:00:00Z".to_string(),
         updated_at: "2026-10-30T00:00:00Z".to_string(),
     };

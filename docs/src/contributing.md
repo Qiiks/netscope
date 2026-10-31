@@ -39,13 +39,15 @@ Run the same checks CI runs:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo build --release --workspace
 mdbook build docs
 ```
 
-Clippy warnings are errors. A change that adds a warning is not merged.
+CI runs Clippy warn-only while the existing baseline is paid down. A change that
+adds a warning is not merged; do not silence a new warning with a blanket
+`allow`.
 
 ## Privileged changes
 

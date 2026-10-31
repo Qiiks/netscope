@@ -112,9 +112,21 @@ If the app is already running, or you do not want to store its install path, use
 sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 ```
 
-No path and no wrapper are involved. The daemon matches the process `comm` or an argv basename, case-insensitively, and attaches it on the next poll. `netscope status` shows `name:Overwatch.exe` and `late`. Sockets opened before the attach are marked at that moment, so their next packets follow the profile without a restart.
+No path and no wrapper are involved. The daemon matches the process `comm` or its executable basename, and any argv basename of a Wine loader, case-insensitively. A new Wine/Proton launch is caught by the loader hold before its first socket; a process that was already running attaches on the next poll and is reported as `late`, with its existing sockets marked so their next packets follow the profile without a restart.
 
-## 9. Run diagnostics
+## 9. Share one process between two tools
+
+When two programs need the same app, name it once per consumer with `open`; a second `add` for the same target is refused:
+
+```sh
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
+  --allow-cidr 34.0.0.0/8
+```
+
+Both consumers get the same profile and cgroup. Each owns its own policy; the last `netscope close <profile> --consumer <id>` removes the scope. See [Shared scopes](shared-scopes.md).
+
+## 10. Run diagnostics
 
 ```sh
 sudo netscope doctor
@@ -122,7 +134,7 @@ sudo netscope doctor
 
 `doctor` exits `0` when every check passes and `1` when any fails. Run it as root (`sudo netscope doctor`); without root the `root` check fails and doctor exits `1`. Add `--json` for machine-readable output. If it fails, see [Troubleshooting](troubleshooting.md).
 
-## 9. Clean up
+## 11. Clean up
 
 ```sh
 sudo netscope remove blocked

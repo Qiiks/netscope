@@ -132,6 +132,11 @@ impl CgroupManager {
             if !seen.insert(pid) {
                 continue;
             }
+            // A prefix's wineserver is shared by every app in it. Moving it
+            // would scope unrelated games and helpers.
+            if crate::proc::is_wineserver(pid) {
+                continue;
+            }
             match self.attach_pid(id, pid, source) {
                 Ok(outcome) => attached.push(outcome.tgid),
                 Err(CgroupError::ProcessGone(_)) => continue,

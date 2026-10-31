@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
+use ipnet::IpNet;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::command::run;
-use crate::types::{Profile, ProfileId, TABLE_BASE};
+use crate::types::{Policy, Profile, ProfileId, TABLE_BASE};
 
 #[derive(Debug, Error)]
 pub enum IpError {
@@ -16,13 +17,16 @@ pub enum IpError {
     TableInUse(u32),
     #[error("profile limit reached")]
     LimitReached,
+    #[error("too many route exceptions (max 30)")]
+    TooManyExceptions,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleEntry {
     mark: u32,
     table: u32,
     priority: u32,
+    dst: Option<IpNet>,
 }
 
 pub fn allocate_index(profiles: &BTreeMap<ProfileId, Profile>, max: u8) -> Result<u8, IpError> {
@@ -32,6 +36,10 @@ pub fn allocate_index(profiles: &BTreeMap<ProfileId, Profile>, max: u8) -> Resul
         .ok_or(IpError::LimitReached)
 }
 
+fn route(profile: &Profile) -> Option<&Policy> {
+    profile.route_policy().map(|(_, policy)| policy)
+}
+
 fn ensure_rule_for_family(
     family: i32,
     mark: u32,
@@ -39,8 +47,11 @@ fn ensure_rule_for_family(
     priority: u32,
 ) -> Result<(), IpError> {
     let rules = rules(family)?;
-    if let Some(existing) = rules.iter().find(|rule| rule.mark == mark) {
-        if existing.table == table && existing.priority == priority {
+    if let Some(existing) = rules
+        .iter()
+        .find(|rule| rule.mark == mark && rule.table == table && rule.dst.is_none())
+    {
+        if existing.priority == priority {
             return Ok(());
         }
         return Err(IpError::MarkInUse(mark));
@@ -57,18 +68,27 @@ fn ensure_rule_for_family(
 }
 
 pub fn ensure(profile: &Profile) -> Result<(), IpError> {
-    if !matches!(profile.mode, crate::types::Mode::Route { .. }) {
+    let Some(Policy::Route {
+        allow_ipv6, except, ..
+    }) = route(profile)
+    else {
         return Ok(());
+    };
+    if except.len() > 30 {
+        return Err(IpError::TooManyExceptions);
     }
     ensure_family(profile, 4)?;
-    if matches!(
-        profile.mode,
-        crate::types::Mode::Route {
-            allow_ipv6: true,
-            ..
-        }
-    ) {
+    if let Err(err) = ensure_exceptions(profile, 4) {
+        let _ = remove_family(profile, 4);
+        return Err(err);
+    }
+    if *allow_ipv6 {
         if let Err(err) = ensure_family(profile, 6) {
+            let _ = remove_family(profile, 4);
+            let _ = remove_family(profile, 6);
+            return Err(err);
+        }
+        if let Err(err) = ensure_exceptions(profile, 6) {
             let _ = remove_family(profile, 4);
             let _ = remove_family(profile, 6);
             return Err(err);
@@ -98,15 +118,16 @@ fn ensure_family(profile: &Profile, family: i32) -> Result<(), IpError> {
     )
     .map_err(|err| IpError::Command(err.to_string()))?;
 
-    let (interface, gateway) = match &profile.mode {
-        crate::types::Mode::Route {
-            interface,
-            gateway,
-            gateway6,
-            ..
-        } => (interface, if family == 6 { gateway6 } else { gateway }),
-        _ => return Ok(()),
+    let Some(Policy::Route {
+        interface,
+        gateway,
+        gateway6,
+        ..
+    }) = route(profile)
+    else {
+        return Ok(());
     };
+    let gateway = if family == 6 { gateway6 } else { gateway };
 
     let mut args = vec![flag, "route", "replace", "default"];
     if let Some(gateway) = gateway {
@@ -125,17 +146,124 @@ fn ensure_family(profile: &Profile, family: i32) -> Result<(), IpError> {
     Ok(())
 }
 
+// Exceptions must be evaluated before the profile's mark rule, or the mark
+// rule would send the excepted destination into the tunnel first.
+fn exception_priority(rule_priority: u32, offset: usize) -> u32 {
+    rule_priority - 1 - offset as u32
+}
+
+/// A route exception goes to `main` before the profile's mark rule, so a
+/// direct-gate pin or PASS network is not pulled into the tunnel.
+fn ensure_exceptions(profile: &Profile, family: i32) -> Result<(), IpError> {
+    let Some(Policy::Route { .. }) = route(profile) else {
+        return Ok(());
+    };
+    if let Some(Policy::Route { except, .. }) = route(profile) {
+        for cidr in except {
+            cidr.parse::<IpNet>()
+                .map_err(|_| IpError::Command(format!("invalid exception {cidr}")))?;
+        }
+    }
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let mark = format!("0x{:x}", profile.mark);
+    prune_exceptions(profile, family, &mark)?;
+    for (offset, cidr) in exception_cidrs(profile, family).iter().enumerate() {
+        let priority = exception_priority(profile.rule_priority, offset).to_string();
+        if let Err(err) = run(
+            "ip",
+            &[
+                flag, "rule", "add", "fwmark", &mark, "to", cidr, "table", "main", "pref",
+                &priority,
+            ],
+            None,
+        ) {
+            // Re-applying an unchanged profile hits the existing rule.
+            if !err.to_string().contains("File exists") {
+                return Err(IpError::Command(err.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Destinations that must stay on the main table before the mark rule.
+///
+/// Loopback is implicit: a route scope that sent `127.0.0.1` or `::1` into
+/// the tunnel would break every local client-server connection.
+fn exception_cidrs(profile: &Profile, family: i32) -> Vec<String> {
+    let except = match route(profile) {
+        Some(Policy::Route { except, .. }) => except.as_slice(),
+        _ => &[],
+    };
+    route_exceptions(except, family)
+}
+
+pub fn route_exceptions(except: &[String], family: i32) -> Vec<String> {
+    let mut cidrs = vec![if family == 6 {
+        "::1/128"
+    } else {
+        "127.0.0.0/8"
+    }
+    .to_string()];
+    for cidr in except {
+        let Ok(net) = cidr.parse::<IpNet>() else {
+            continue;
+        };
+        if (family == 6) == matches!(net, IpNet::V6(_)) {
+            cidrs.push(cidr.clone());
+        }
+    }
+    cidrs
+}
+
+// A policy change can leave exceptions from the previous list in place; they
+// would keep sending those destinations direct.
+fn prune_exceptions(profile: &Profile, family: i32, mark: &str) -> Result<(), IpError> {
+    if !matches!(route(profile), Some(Policy::Route { .. })) {
+        return Ok(());
+    }
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let keep: Vec<(u32, Option<IpNet>)> = exception_cidrs(profile, family)
+        .iter()
+        .enumerate()
+        .map(|(offset, cidr)| {
+            (
+                exception_priority(profile.rule_priority, offset),
+                cidr.parse::<IpNet>().ok(),
+            )
+        })
+        .collect();
+    for rule in rules(family)? {
+        if rule.mark != profile.mark
+            || rule.table != MAIN_TABLE
+            || keep
+                .iter()
+                .any(|(priority, dst)| *priority == rule.priority && *dst == rule.dst)
+        {
+            continue;
+        }
+        let _ = run(
+            "ip",
+            &[
+                flag,
+                "rule",
+                "del",
+                "fwmark",
+                mark,
+                "table",
+                "main",
+                "pref",
+                &rule.priority.to_string(),
+            ],
+            None,
+        );
+    }
+    Ok(())
+}
+
 pub fn remove(profile: &Profile) -> Result<(), IpError> {
     let _ = remove_family(profile, 4);
-    if matches!(
-        profile.mode,
-        crate::types::Mode::Route {
-            allow_ipv6: true,
-            ..
-        }
-    ) {
-        let _ = remove_family(profile, 6);
-    }
+    let _ = remove_family(profile, 6);
     Ok(())
 }
 
@@ -151,14 +279,40 @@ fn remove_family(profile: &Profile, family: i32) -> Result<(), IpError> {
         ],
         None,
     );
+    for rule in rules(family).unwrap_or_default() {
+        if rule.mark == profile.mark && rule.table == MAIN_TABLE {
+            let _ = run(
+                "ip",
+                &[
+                    flag,
+                    "rule",
+                    "del",
+                    "fwmark",
+                    &mark,
+                    "table",
+                    "main",
+                    "pref",
+                    &rule.priority.to_string(),
+                ],
+                None,
+            );
+        }
+    }
     let _ = run("ip", &[flag, "route", "flush", "table", &table], None);
     Ok(())
 }
 
 pub fn exists(profile: &Profile) -> Result<bool, IpError> {
-    if !matches!(profile.mode, crate::types::Mode::Route { .. }) {
+    let Some(Policy::Route {
+        allow_ipv6,
+        interface,
+        gateway,
+        gateway6,
+        ..
+    }) = route(profile)
+    else {
         return Ok(true);
-    }
+    };
     let rule_ok = rules(4)?.iter().any(|rule| {
         rule.mark == profile.mark
             && rule.table == profile.table
@@ -167,23 +321,55 @@ pub fn exists(profile: &Profile) -> Result<bool, IpError> {
     if !rule_ok {
         return Ok(false);
     }
-    let route_ok = blackhole_default(4, profile.table)?;
-    if matches!(
-        profile.mode,
-        crate::types::Mode::Route {
-            allow_ipv6: true,
-            ..
-        }
-    ) {
+    let route_ok = blackhole_default(4, profile.table)?
+        && tunnel_default(4, profile.table, interface, gateway.as_deref())?;
+    if !exceptions_ok(profile, 4)? {
+        return Ok(false);
+    }
+    if *allow_ipv6 {
         return Ok(route_ok
             && rules(6)?.iter().any(|rule| {
                 rule.mark == profile.mark
                     && rule.table == profile.table
                     && rule.priority == profile.rule_priority
             })
-            && blackhole_default(6, profile.table)?);
+            && blackhole_default(6, profile.table)?
+            && tunnel_default(6, profile.table, interface, gateway6.as_deref())?
+            && exceptions_ok(profile, 6)?);
     }
     Ok(route_ok)
+}
+
+/// Canonicalizes a CIDR to its network address so stored policies compare
+/// equal to what `ip` and nftables report.
+pub fn normalize_cidr(text: &str) -> Result<String, String> {
+    text.parse::<IpNet>()
+        .map(|net| net.trunc().to_string())
+        .map_err(|_| format!("invalid cidr {text}"))
+}
+
+const MAIN_TABLE: u32 = 254;
+
+fn exceptions_ok(profile: &Profile, family: i32) -> Result<bool, IpError> {
+    if !matches!(route(profile), Some(Policy::Route { .. })) {
+        return Ok(true);
+    }
+    let rules = rules(family)?;
+    for (offset, cidr) in exception_cidrs(profile, family).iter().enumerate() {
+        let net: IpNet = cidr
+            .parse()
+            .map_err(|_| IpError::Command(format!("invalid exception {cidr}")))?;
+        let priority = exception_priority(profile.rule_priority, offset);
+        if !rules.iter().any(|rule| {
+            rule.mark == profile.mark
+                && rule.table == MAIN_TABLE
+                && rule.priority == priority
+                && rule.dst == Some(net)
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn table_in_use(table: u32) -> Result<bool, IpError> {
@@ -209,6 +395,30 @@ fn blackhole_default(family: i32, table: u32) -> Result<bool, IpError> {
                 && entry.get("dst").and_then(Value::as_str) == Some("default")
         })
     }))
+}
+
+fn tunnel_default(
+    family: i32,
+    table: u32,
+    interface: &str,
+    gateway: Option<&str>,
+) -> Result<bool, IpError> {
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let value = show_routes(flag, table)?;
+    Ok(value.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| is_tunnel_default(entry, interface, gateway))
+    }))
+}
+
+fn is_tunnel_default(entry: &Value, interface: &str, gateway: Option<&str>) -> bool {
+    entry.get("dst").and_then(Value::as_str) == Some("default")
+        && entry.get("type").and_then(Value::as_str) != Some("blackhole")
+        && entry.get("dev").and_then(Value::as_str) == Some(interface)
+        && entry.get("metric").and_then(Value::as_u64) == Some(100)
+        && gateway
+            .is_none_or(|expected| entry.get("gateway").and_then(Value::as_str) == Some(expected))
 }
 
 // `ip route show table N` exits 2 when the table has never been created;
@@ -253,7 +463,7 @@ fn parse_rules(value: &Value) -> Vec<RuleEntry> {
                         .get("fwmark")
                         .and_then(value_u32)
                         .or_else(|| entry.get("mark").and_then(value_u32))?;
-                    let table = entry.get("table").and_then(value_u32)?;
+                    let table = entry.get("table").and_then(table_u32)?;
                     let priority = entry
                         .get("priority")
                         .and_then(value_u32)
@@ -262,11 +472,39 @@ fn parse_rules(value: &Value) -> Vec<RuleEntry> {
                         mark,
                         table,
                         priority,
+                        dst: rule_dst(entry),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// `ip -j rule show` reports a network as `dst` plus a separate `dstlen`.
+fn rule_dst(entry: &Value) -> Option<IpNet> {
+    let text = entry.get("dst").and_then(Value::as_str)?;
+    if let Ok(net) = text.parse::<IpNet>() {
+        return Some(net);
+    }
+    let address = text.parse().ok()?;
+    let len = entry
+        .get("dstlen")
+        .and_then(value_u32)
+        .unwrap_or(match address {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        });
+    let len = u8::try_from(len).ok()?;
+    IpNet::new(address, len).ok()
+}
+
+fn table_u32(value: &Value) -> Option<u32> {
+    match value.as_str() {
+        Some("main") => Some(MAIN_TABLE),
+        Some("local") => Some(255),
+        Some("default") => Some(253),
+        _ => value_u32(value),
+    }
 }
 
 fn value_u32(value: &Value) -> Option<u32> {
@@ -286,6 +524,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn route_exceptions_always_keep_loopback() {
+        let except = vec!["34.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        assert_eq!(
+            route_exceptions(&except, 4),
+            vec!["127.0.0.0/8", "34.0.0.0/8"]
+        );
+        assert_eq!(
+            route_exceptions(&except, 6),
+            vec!["::1/128", "2001:db8::/32"]
+        );
+    }
+
+    #[test]
     fn parses_rule_json_strings() {
         let value: Value =
             serde_json::from_str(r#"[{"priority":1000,"fwmark":"0x4e53","table":"20000"}]"#)
@@ -295,9 +546,62 @@ mod tests {
             vec![RuleEntry {
                 mark: 0x4e53,
                 table: 20000,
-                priority: 1000
+                priority: 1000,
+                dst: None
             }]
         );
+    }
+
+    #[test]
+    fn cidr_normalization_masks_host_bits() {
+        assert_eq!(normalize_cidr("1.1.1.1/24").unwrap(), "1.1.1.0/24");
+        assert_eq!(normalize_cidr("2001:db8::1/32").unwrap(), "2001:db8::/32");
+        assert!(normalize_cidr("1.1.1.1/33").is_err());
+        assert!(normalize_cidr("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn tunnel_default_matches_route_and_rejects_blackhole() {
+        let route: Value = serde_json::from_str(
+            r#"{"dst":"default","type":"unicast","dev":"tun0","metric":100,"gateway":"10.0.0.1"}"#,
+        )
+        .unwrap();
+        assert!(is_tunnel_default(&route, "tun0", Some("10.0.0.1")));
+        assert!(!is_tunnel_default(&route, "tun1", Some("10.0.0.1")));
+        assert!(!is_tunnel_default(&route, "tun0", Some("10.0.0.2")));
+        let blackhole: Value = serde_json::from_str(
+            r#"{"dst":"default","type":"blackhole","dev":"tun0","metric":100}"#,
+        )
+        .unwrap();
+        assert!(!is_tunnel_default(&blackhole, "tun0", None));
+    }
+
+    #[test]
+    fn parses_named_table_in_exception_rule() {
+        let value: Value = serde_json::from_str(
+            r#"[{"priority":999,"dst":"34.0.0.0","dstlen":8,"fwmark":"0x4e53","table":"main"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_rules(&value),
+            vec![RuleEntry {
+                mark: 0x4e53,
+                table: MAIN_TABLE,
+                priority: 999,
+                dst: Some("34.0.0.0/8".parse().unwrap())
+            }]
+        );
+    }
+
+    #[test]
+    fn exception_rules_precede_the_mark_rule() {
+        assert_eq!(exception_priority(1000, 0), 999);
+        assert_eq!(exception_priority(1032, 0), 1031);
+        assert_eq!(exception_priority(1032, 29), 1002);
+        for index in 0..32 {
+            assert!(exception_priority(1000 + 32 * index, 29) > 0);
+            assert!(exception_priority(1000 + 32 * index, 0) < 1000 + 32 * index);
+        }
     }
 
     #[test]

@@ -557,8 +557,10 @@ fn collect_ip(builder: &mut Builder, state: Option<&State>) -> Result<()> {
     let mut tables = BTreeSet::new();
     if let Some(state) = state {
         for profile in state.profiles.values() {
-            if let Mode::Route { allow_ipv6, .. } = &profile.mode {
-                tables.insert((profile.table, *allow_ipv6));
+            for policy in profile.policies.values() {
+                if let Mode::Route { allow_ipv6, .. } = policy {
+                    tables.insert((profile.table, *allow_ipv6));
+                }
             }
         }
     }

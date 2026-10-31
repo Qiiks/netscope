@@ -136,6 +136,38 @@ pub fn clear_mark(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
     Ok(cleared)
 }
 
+/// Clears `mark` from every process on the system that still carries it.
+///
+/// Profile ids are reusable, so a mark caught by a process that escaped the
+/// profile cgroup must not survive the profile. Scanning `/proc` is
+/// expensive; call this only when a profile is removed or disabled.
+///
+/// # Errors
+///
+/// Returns [`SocketMarkError::Inspect`] only when `/proc` cannot be read.
+/// Processes that vanish or cannot be inspected are skipped.
+pub fn clear_mark_all(mark: u32) -> Result<usize, SocketMarkError> {
+    let entries =
+        fs::read_dir("/proc").map_err(|source| SocketMarkError::Inspect { pid: 0, source })?;
+    let mut cleared = 0;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        match clear_mark(pid, mark) {
+            Ok(count) => cleared += count,
+            Err(SocketMarkError::ProcessGone(_)) => {}
+            Err(err) => {
+                tracing::debug!("clear mark {mark:#x} pid={pid} error={err}");
+            }
+        }
+    }
+    Ok(cleared)
+}
+
 /// Lists the marks currently set on the IPv4 and IPv6 sockets of `pid`.
 ///
 /// Returns `(fd, mark)` pairs. Non-socket descriptors are skipped. This is a
@@ -204,7 +236,14 @@ fn process_fds(pid: u32) -> Result<Vec<i32>, SocketMarkError> {
         let Ok(fd) = name.parse::<i32>() else {
             continue;
         };
-        if fd >= 0 {
+        if fd < 0 {
+            continue;
+        }
+        // Only sockets are ever marked; skipping the rest avoids a
+        // pidfd_getfd round trip for every file the process holds.
+        let is_socket = fs::read_link(entry.path())
+            .is_ok_and(|target| target.to_string_lossy().starts_with("socket:["));
+        if is_socket {
             fds.push(fd);
         }
     }

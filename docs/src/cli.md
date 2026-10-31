@@ -42,11 +42,11 @@ Prints the daemon version, pid, kernel, cgroup root, and one row per profile. Th
 ```text
 DAEMON  netscoped 0.2.0  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
-NAME     MODE    ENABLED  TARGET                      ATTACHED  PIDS
-blocked  filter  yes      /usr/bin/curl               pre-exec  4242
-game     route   yes      wine:/games/Game/Game.exe   pre-open  5150
-running  route   yes      name:Overwatch.exe          late      6120
-routed   route   yes      /usr/bin/firefox            late      5150,5151
+NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          PIDS
+blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        4242
+game       route   yes      wine:/games/Game/Game.exe   pre-open  cli               cli:route         5150
+running    route   yes      name:Overwatch.exe          late      cli               cli:route         6120
+shared     route   yes      name:Overwatch.exe          pre-exec  dropship,exitlink exitlink:route    7001
 ```
 
 The state path and config path are available in `--json` output.
@@ -88,37 +88,78 @@ Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` 
 | `--gateway6 <ipv6>` | `--route --allow-ipv6` | IPv6 next hop. |
 | `--include-lan` | `--route` | Route LAN destinations instead of bypassing them. |
 | `--allow-ipv6` | `--route` | Carry IPv6; without it, IPv6 is dropped. |
+| `--except <cidr>` | `--route` | Destination that stays direct. Repeatable, up to 30. |
 
 Rules enforced before the daemon is asked:
 
 - Name: `^[a-z0-9][a-z0-9-]{0,31}$`.
 - Exactly one target: `--exe`, `--wine`, `--process`, or `--steam`. Combining them is a usage error.
 - `--wine` takes an absolute path to a regular file that starts with `MZ`. The daemon canonicalizes the path and stores its device and inode.
-- `--process` takes a name, not a path. It is matched against the process `comm` and argv basenames; `Overwatch`, `Overwatch.exe`, and `overwatch.exe` are the same target. It attaches on the poll, so sockets opened before the attach keep their original route.
+- `--process` takes a name, not a path. It is matched against the process `comm` and its executable basename, and against any argv basename of a Wine loader; `Overwatch`, `Overwatch.exe`, and `overwatch.exe` are the same target. A new Wine/Proton launch is caught by the loader hold before its first socket; an already-running process attaches on the poll and has its existing sockets marked.
 - `--allow-cidr` is rejected with `--filter allow`.
 - `--deny-cidr` is rejected with `--filter drop`, and `--filter allow` needs at least one.
 - `--gateway` is rejected outside `--route`.
 - `--gateway6` is rejected without `--allow-ipv6`.
-- `--include-lan` and `--allow-ipv6` are rejected outside `--route`.
+- `--include-lan`, `--allow-ipv6`, and `--except` are rejected outside `--route`.
+- `--except` takes up to 30 CIDRs. The daemon installs each as an `ip rule` to `main` at a lower priority than the mark rule.
 
 On success the daemon creates the cgroup, the nftables table, and, for route profiles, the policy rule and routes. If the app was already running and got attached late, the CLI prints:
 
 ```text
-existing connections unaffected; restart the app for full coverage
+existing sockets marked; restart is not required
 ```
 
 ```sh
 sudo netscope --uid "$(id -u)" add blocked --exe /usr/bin/curl --filter drop
 sudo netscope --uid "$(id -u)" add routed --exe /usr/bin/game --route tun0 --include-lan
 sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter drop
-sudo netscope --uid "$(id -u)" add game-route --wine /games/Game/Game.exe --route tun0
 sudo netscope --uid "$(id -u)" add running-game --process Overwatch.exe --route tun0
 sudo netscope add steam-game --steam 730 --filter drop --allow-cidr 203.0.113.0/24
 ```
 
 The last example assumes the user is in the `netscope` group and has re-logged in. On success, `add` prints `added <name>`; with a late attach it prints the restart warning on the next line.
 
-For a Wine target the profile attaches when a Wine process opens the PE, which is before the game runs. Launch the game the same way you would without netscope — there is no wrapper. A `--process` target is for a process that is already running or that starts within the poll interval; it does not need the path and is reported as `late`. See [Wine and Proton targets](how-it-works.md#wine-and-proton-targets) and [Name targets](how-it-works.md#name-targets).
+For a Wine target the profile attaches when a Wine process opens the PE, which is before the game runs. Launch the game the same way you would without netscope — there is no wrapper. A `--process` target holds the Wine/Proton loaders and attaches a new launch before its first socket; an already-running process attaches on the poll and is reported as `late`. See [Wine and Proton targets](how-it-works.md#wine-and-proton-targets) and [Name targets](how-it-works.md#name-targets).
+
+## `open`, `policy`, `close`, and `resolve`
+
+```text
+netscope open --consumer <id> [--name <profile>] <TARGET> [POLICY]
+netscope policy <profile> --consumer <id> (--filter ... | --route ...)
+netscope close <profile> --consumer <id>
+netscope resolve (--profile <id> | <TARGET>)
+```
+
+`open` creates or joins a shared profile for `(target, target uid)`. Two
+consumers with the same target and uid get the same profile and cgroup. The
+first consumer creates the scope; the last `close` removes it. `--name` names a
+new profile; without it the daemon generates one from the target and uid (for
+example `overwatch-u1000`). The CLI holds its claim persistently, so it
+survives the command. Peer claims belong to API clients that keep their control
+connection open; they are not available from the one-shot CLI. The target flags
+are the same as `add`, and a policy may be attached in the same command.
+
+`policy` replaces one consumer's policy. A shared profile can carry several
+filter policies but only one route policy; a second consumer asking for a route
+gets an error. Filters run before the route mark, so a drop
+from any consumer is terminal for that packet and an accepted packet continues
+to the route mark.
+
+`close` releases one consumer and reports whether the profile was removed.
+`resolve` finds the shared profile from an id or a target and prints it. If
+`open` succeeds but its policy is rejected, the claim is kept: retry
+`netscope policy`, or `netscope close` it.
+
+```sh
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
+  --allow-cidr 34.0.0.0/8
+sudo netscope policy overwatch --consumer exitlink --route tun0 \
+  --except 203.0.113.0/24
+sudo netscope close overwatch --consumer dropship
+```
+
+See [Shared scopes](shared-scopes.md).
 
 ## `remove`
 

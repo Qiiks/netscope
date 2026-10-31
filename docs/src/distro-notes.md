@@ -78,6 +78,6 @@ The v0.2.0 release tarball is x86_64 only, and `install.sh` rejects other archit
 
 ## Firewall coexistence
 
-netscope adds its own `inet` tables named `netscope_filter_*` and `netscope_route_*`, plus `ip rule` entries and tables in the `20000`–`20031` range. It does not modify your existing firewall tables or the main routing table.
+netscope adds its own `inet` tables named `netscope_*`, plus `ip rule` entries and tables in the `20000`–`20031` range. It does not modify your existing firewall tables or the main routing table.
 
 If another tool flushes all nftables tables or all routing rules, profiles break until the daemon's health loop recreates them, within about ten seconds. If the other tool removes them continuously, the two tools are incompatible on that host.

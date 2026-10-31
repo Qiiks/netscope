@@ -4,6 +4,7 @@
 - [Install](install.md)
 - [Quick start](quickstart.md)
 - [How it works](how-it-works.md)
+- [Shared scopes](shared-scopes.md)
 - [Filter mode](modes/filter.md)
 - [Route mode](modes/route.md)
 - [Configuration](configuration.md)
