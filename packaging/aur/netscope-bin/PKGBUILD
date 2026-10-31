@@ -9,7 +9,7 @@ depends=('nftables' 'iproute2' 'systemd')
 backup=('etc/netscope/config.toml')
 install=netscope-bin.install
 source=("$url/releases/download/v$pkgver/netscope-v$pkgver-x86_64-linux.tar.zst")
-sha256sums=('SKIP')
+sha256sums=('6092787cbb407a79b032294a37063456035257518737e4eb873b218909bb5052')
 
 package() {
   cd "$srcdir/netscope-v$pkgver-x86_64-linux"

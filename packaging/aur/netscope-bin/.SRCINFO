@@ -12,6 +12,6 @@ pkgbase = netscope-bin
 	depends = systemd
 	backup = etc/netscope/config.toml
 	source = https://github.com/Qiiks/netscope/releases/download/v0.1.0/netscope-v0.1.0-x86_64-linux.tar.zst
-	sha256sums = SKIP
+	sha256sums = 6092787cbb407a79b032294a37063456035257518737e4eb873b218909bb5052
 
 pkgname = netscope-bin
