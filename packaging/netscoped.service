@@ -16,13 +16,11 @@ Environment=RUST_LOG=info
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
 AmbientCapabilities=
 NoNewPrivileges=yes
-# Needs write access to the cgroup tree and /sys/fs/cgroup remounts.
-ProtectSystem=no
+ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectControlGroups=no
-# The cgroup tree is a kernel interface this daemon must create and write.
-ProtectKernelTunables=no
+ProtectKernelTunables=yes
 # nft_socket may autoload on the first cgroupv2 rule; blocking module load breaks filter/route setup.
 ProtectKernelModules=no
 ProtectClock=yes
