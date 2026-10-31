@@ -1,6 +1,6 @@
 pkgbase = netscope-bin
 	pkgdesc = Per-application network scoping for Linux
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/Qiiks/netscope
 	install = netscope-bin.install
@@ -11,7 +11,7 @@ pkgbase = netscope-bin
 	depends = iproute2
 	depends = systemd
 	backup = etc/netscope/config.toml
-	source = https://github.com/Qiiks/netscope/releases/download/v0.1.0/netscope-v0.1.0-x86_64-linux.tar.zst
-	sha256sums = 6092787cbb407a79b032294a37063456035257518737e4eb873b218909bb5052
+	source = https://github.com/Qiiks/netscope/releases/download/v0.2.0/netscope-v0.2.0-x86_64-linux.tar.zst
+	sha256sums = d7bb182fe7c21eb7c6fc77e5f069bf8e03a317a086dd3cdb9c1840e9297f3d64
 
 pkgname = netscope-bin

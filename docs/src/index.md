@@ -8,7 +8,7 @@ Per-app network scoping for Linux. Select an app once. Launch it normally.
 
 Most Linux VPN and proxy tools route the whole machine or require a wrapper. netscope gives one application its own cgroup identity and applies a filter or a routing mark to that identity, so the app starts the way you already start it.
 
-## Three pieces
+## What it does
 
 - **Normally launched apps.** `fanotify` catches `exec` and places the process in its profile cgroup before the first socket.
 - **Running apps by name.** A `--process` target attaches a process by `comm` or argv basename, with no install path and no wrapper; attachment is late and existing sockets keep their old route.
