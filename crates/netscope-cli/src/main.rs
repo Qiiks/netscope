@@ -152,6 +152,12 @@ struct AddArgs {
     include_lan: bool,
     #[arg(long, requires = "route")]
     allow_ipv6: bool,
+    /// Mark only IPv4 UDP; TCP keeps its normal route
+    #[arg(long, requires = "route")]
+    udp: bool,
+    /// UDP destination port that stays direct (repeatable)
+    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    except_port: Vec<u16>,
 }
 
 #[derive(Args)]
@@ -198,6 +204,12 @@ struct OpenArgs {
     include_lan: bool,
     #[arg(long, requires = "route")]
     allow_ipv6: bool,
+    /// Mark only IPv4 UDP; TCP keeps its normal route
+    #[arg(long, requires = "route")]
+    udp: bool,
+    /// UDP destination port that stays direct (repeatable)
+    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    except_port: Vec<u16>,
 }
 
 #[derive(Args)]
@@ -234,6 +246,12 @@ struct PolicyArgs {
     include_lan: bool,
     #[arg(long, requires = "route")]
     allow_ipv6: bool,
+    /// Mark only IPv4 UDP; TCP keeps its normal route
+    #[arg(long, requires = "route")]
+    udp: bool,
+    /// UDP destination port that stays direct (repeatable)
+    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    except_port: Vec<u16>,
 }
 
 fn main() {
@@ -320,6 +338,8 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
         gateway6: args.gateway6,
         include_lan: args.include_lan,
         allow_ipv6: args.allow_ipv6,
+        udp_only: args.udp,
+        except_ports: args.except_port,
         target_uid,
     };
     match commands::build_add(input) {
@@ -354,6 +374,8 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
         gateway6: args.gateway6.clone(),
         include_lan: args.include_lan,
         allow_ipv6: args.allow_ipv6,
+        udp_only: args.udp,
+        except_ports: args.except_port.clone(),
         target_uid,
     };
     let target = match commands::build_target(&input) {
@@ -371,6 +393,8 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
             gateway6: args.gateway6.as_deref(),
             include_lan: args.include_lan,
             allow_ipv6: args.allow_ipv6,
+            udp_only: args.udp,
+            except_ports: &args.except_port,
         }) {
             Ok(policy) => Some(policy),
             Err(message) => return usage(&message),
@@ -402,6 +426,8 @@ fn policy(args: PolicyArgs, socket: &Path) -> i32 {
         gateway6: args.gateway6.as_deref(),
         include_lan: args.include_lan,
         allow_ipv6: args.allow_ipv6,
+        udp_only: args.udp,
+        except_ports: &args.except_port,
     }) {
         Ok(policy) => policy,
         Err(message) => return usage(&message),

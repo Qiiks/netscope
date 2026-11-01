@@ -2935,6 +2935,8 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             gateway6,
             include_lan,
             allow_ipv6,
+            udp_only,
+            except_ports,
             except,
         } => {
             if interface.is_empty()
@@ -2967,6 +2969,18 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             if except.len() > 30 {
                 return Err("route policy accepts at most 30 exception networks".to_string());
             }
+            if except_ports.len() > 32 {
+                return Err("route policy accepts at most 32 exception ports".to_string());
+            }
+            let mut ports = except_ports.clone();
+            ports.sort_unstable();
+            ports.dedup();
+            if ports.contains(&0) {
+                return Err("route exception ports must be 1..=65535".to_string());
+            }
+            if !*udp_only && !ports.is_empty() {
+                return Err("except_ports requires udp_only".to_string());
+            }
             let mut normalized = Vec::with_capacity(except.len());
             for cidr in except {
                 let canonical = parse_cidr(cidr)?;
@@ -2981,6 +2995,8 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
                 gateway6: normalized_gateway6,
                 include_lan: *include_lan,
                 allow_ipv6: *allow_ipv6,
+                udp_only: *udp_only,
+                except_ports: ports,
                 except: normalized,
             })
         }

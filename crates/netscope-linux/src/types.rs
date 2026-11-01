@@ -80,6 +80,13 @@ pub enum Policy {
         gateway6: Option<String>,
         include_lan: bool,
         allow_ipv6: bool,
+        /// Mark only IPv4 UDP. TCP stays on the host's normal path, which lets
+        /// a TCP proxy and this route share one process.
+        #[serde(default)]
+        udp_only: bool,
+        /// UDP destination ports that stay direct.
+        #[serde(default)]
+        except_ports: Vec<u16>,
         #[serde(default)]
         except: Vec<String>,
     },
@@ -105,6 +112,10 @@ pub enum PolicySpec {
         include_lan: bool,
         #[serde(default)]
         allow_ipv6: bool,
+        #[serde(default)]
+        udp_only: bool,
+        #[serde(default)]
+        except_ports: Vec<u16>,
         #[serde(default)]
         except: Vec<String>,
     },

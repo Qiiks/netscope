@@ -17,6 +17,8 @@ The interface must already exist and be up. If it does not, the daemon fails to 
 | `--gateway6 <ipv6>` | IPv6 next hop. Only valid with `--allow-ipv6`. |
 | `--include-lan` | Route LAN destinations through the tunnel instead of bypassing them. |
 | `--allow-ipv6` | Carry IPv6 through the profile. Without it, all IPv6 from the profile is dropped. |
+| `--udp` | Mark only IPv4 UDP. TCP keeps its normal route, so a TCP proxy can own TCP on the same process. |
+| `--except-port <port>` | UDP destination port that stays direct. Repeatable, up to 32; requires `--udp`. |
 | `--except <cidr>` | Destination that stays direct. Repeatable, up to 30. The daemon installs an `ip rule` to `main` at a lower priority than the mark rule. Loopback is always kept direct the same way and does not count against the 30. |
 
 `--gateway` and `--gateway6` are mutually exclusive with the wrong family: `--gateway6` requires `--allow-ipv6`, and `--gateway` is IPv4 only.
@@ -28,7 +30,7 @@ The nftables chain for a route profile:
 1. accepts loopback (`127.0.0.0/8`, `::1/128`);
 2. unless `--include-lan`, accepts the LAN and link-local ranges listed below;
 3. unless `--allow-ipv6`, drops all IPv6;
-4. sets the profile mark on everything left.
+4. with `--udp`, accepts the `--except-port` destinations and then sets the mark on IPv4 UDP only; without it, sets the mark on everything left.
 
 The mark is then matched by an `ip rule`:
 
@@ -52,6 +54,23 @@ fwmark 0x4e53 to 203.0.113.0/24 table main pref 999
 ```
 
 A packet from the profile to an excepted destination matches that rule first and uses the main table; everything else reaches the mark rule and uses the profile table. Exceptions are removed with the profile.
+
+## UDP-only routes
+
+`--udp` narrows the mark rule to IPv4 UDP. TCP from the same process is not
+marked and keeps the host's normal route, which is what lets a TCP proxy and a
+UDP route share one application. Excluded UDP ports return with `accept`
+before the mark, so DNS (`53`) or a game's own local port can stay direct:
+
+```sh
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch \
+  --process Overwatch.exe --route tun0 --udp \
+  --except-port 53 --except-port 29523
+```
+
+Late attach still covers sockets that existed before the profile: the daemon
+sets the same mark on the process's open descriptors, and only UDP packets are
+matched by the narrowed rule.
 
 ## LAN bypass
 

@@ -88,6 +88,8 @@ Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` 
 | `--gateway6 <ipv6>` | `--route --allow-ipv6` | IPv6 next hop. |
 | `--include-lan` | `--route` | Route LAN destinations instead of bypassing them. |
 | `--allow-ipv6` | `--route` | Carry IPv6; without it, IPv6 is dropped. |
+| `--udp` | `--route` | Mark only IPv4 UDP; TCP keeps its normal route. |
+| `--except-port <port>` | `--route --udp` | UDP destination port that stays direct. Repeatable, up to 32. |
 | `--except <cidr>` | `--route` | Destination that stays direct. Repeatable, up to 30. |
 
 Rules enforced before the daemon is asked:
@@ -100,7 +102,8 @@ Rules enforced before the daemon is asked:
 - `--deny-cidr` is rejected with `--filter drop`, and `--filter allow` needs at least one.
 - `--gateway` is rejected outside `--route`.
 - `--gateway6` is rejected without `--allow-ipv6`.
-- `--include-lan`, `--allow-ipv6`, and `--except` are rejected outside `--route`.
+- `--include-lan`, `--allow-ipv6`, `--udp`, `--except-port`, and `--except` are rejected outside `--route`.
+- `--except-port` requires `--udp` and takes 32 ports; port `0` is rejected.
 - `--except` takes up to 30 CIDRs. The daemon installs each as an `ip rule` to `main` at a lower priority than the mark rule.
 
 On success the daemon creates the cgroup, the nftables table, and, for route profiles, the policy rule and routes. If the app was already running and got attached late, the CLI prints:
@@ -114,6 +117,7 @@ sudo netscope --uid "$(id -u)" add blocked --exe /usr/bin/curl --filter drop
 sudo netscope --uid "$(id -u)" add routed --exe /usr/bin/game --route tun0 --include-lan
 sudo netscope --uid "$(id -u)" add game --wine /games/Game/Game.exe --filter drop
 sudo netscope --uid "$(id -u)" add running-game --process Overwatch.exe --route tun0
+sudo netscope --uid "$(id -u)" add game-udp --process Overwatch.exe --route tun0 --udp --except-port 53
 sudo netscope add steam-game --steam 730 --filter drop --allow-cidr 203.0.113.0/24
 ```
 

@@ -158,6 +158,8 @@ impl NftManager {
                 gateway6: _,
                 include_lan,
                 allow_ipv6,
+                udp_only,
+                except_ports,
                 ..
             },
         )) = profile.route_policy()
@@ -174,7 +176,25 @@ impl NftManager {
             if !allow_ipv6 {
                 rules.push("meta nfproto ipv6 counter drop".to_string());
             }
-            rules.push(format!("counter meta mark set 0x{:x}", profile.mark));
+            let selector = if *udp_only {
+                if !except_ports.is_empty() {
+                    let ports = except_ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    rules.push(format!(
+                        "meta nfproto ipv4 meta l4proto udp udp dport {{ {ports} }} accept"
+                    ));
+                }
+                "meta nfproto ipv4 meta l4proto udp "
+            } else {
+                ""
+            };
+            rules.push(format!(
+                "{selector}counter meta mark set 0x{:x}",
+                profile.mark
+            ));
         }
 
         // A route chain reroutes after the mark is set; a filter chain does
@@ -337,6 +357,8 @@ mod tests {
                     gateway6: None,
                     include_lan: false,
                     allow_ipv6: false,
+                    udp_only: false,
+                    except_ports: Vec::new(),
                     except: Vec::new(),
                 },
             ),
@@ -346,6 +368,34 @@ mod tests {
         assert!(body.contains("meta nfproto != { ipv4, ipv6 } counter drop"));
         assert!(!body.contains("34.0.0.0/8 accept"));
         assert!(body.contains("meta mark set 0x4e53"));
+    }
+
+    #[test]
+    fn udp_route_marks_only_udp_and_excepts_ports() {
+        let manager = NftManager::new(Path::new("/sys/fs/cgroup/netscope")).unwrap();
+        let profile = profile(vec![(
+            "exitlink",
+            Policy::Route {
+                interface: "tun0".to_string(),
+                gateway: None,
+                gateway6: None,
+                include_lan: false,
+                allow_ipv6: false,
+                udp_only: true,
+                except_ports: vec![53, 1900],
+                except: Vec::new(),
+            },
+        )]);
+        let body = NftManager::render_body(&profile, &manager.profile_selectors(&profile)).unwrap();
+        assert!(body.contains("meta l4proto udp udp dport { 53, 1900 } accept"));
+        assert!(body.contains("meta nfproto ipv4 meta l4proto udp counter meta mark set 0x4e53"));
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.contains("counter meta mark set")
+                    && !line.contains("meta l4proto udp")),
+            "the UDP selector must be part of the mark rule"
+        );
     }
 
     #[test]
@@ -367,6 +417,8 @@ mod tests {
                     gateway6: None,
                     include_lan: false,
                     allow_ipv6: false,
+                    udp_only: false,
+                    except_ports: Vec::new(),
                     except: Vec::new(),
                 },
             ),

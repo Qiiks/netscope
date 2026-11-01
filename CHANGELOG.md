@@ -13,6 +13,9 @@
   the scope before its first socket; a running process still attaches late.
 - Late attach marks existing sockets with the profile firewall mark, so a game
   does not need a restart after the profile is created.
+- Route policies accept `--udp` and `--except-port`: only IPv4 UDP is marked,
+  so a TCP proxy can own the same process. Port exceptions return before the
+  mark.
 
 ### Fixed
 
