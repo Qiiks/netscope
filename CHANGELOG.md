@@ -19,6 +19,10 @@
 
 ### Fixed
 
+- The daemon's seccomp allow-list now includes `pidfd_getfd`. `clear_mark_all`
+  uses it on the first reconcile; the hardened unit previously killed
+  `netscoped` with `SIGSYS` before it served a request, leaving ExitLink on its
+  sport-rule fallback.
 - The systemd unit now keeps `ProtectSystem=strict` while allowing the daemon
   to create `/sys/fs/cgroup/netscope` (`CAP_DAC_OVERRIDE` plus the cgroup root
   in `ReadWritePaths`).
