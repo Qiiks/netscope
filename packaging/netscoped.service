@@ -31,7 +31,10 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 SystemCallArchitectures=native
-SystemCallFilter=@system-service @privileged fanotify_init fanotify_mark
+# `pidfd_getfd` is how the daemon duplicates a target's socket to clear a stale
+# SO_MARK at startup and to mark sockets that predate attachment. It is not in
+# @privileged; without it the first reconcile dies with SIGSYS (status 31/SYS).
+SystemCallFilter=@system-service @privileged fanotify_init fanotify_mark pidfd_getfd
 RuntimeDirectory=netscope
 RuntimeDirectoryMode=0755
 StateDirectory=netscope
