@@ -87,6 +87,12 @@ pub enum Policy {
         /// UDP destination ports that stay direct.
         #[serde(default)]
         except_ports: Vec<u16>,
+        /// UDP source ports that stay direct. A socket keeps its source port
+        /// for its whole life, so this pins the sockets that already existed
+        /// when the route opened: rerouting a live flow would change its
+        /// game-visible source and the server would drop it.
+        #[serde(default)]
+        except_sports: Vec<u16>,
         #[serde(default)]
         except: Vec<String>,
     },
@@ -116,6 +122,8 @@ pub enum PolicySpec {
         udp_only: bool,
         #[serde(default)]
         except_ports: Vec<u16>,
+        #[serde(default)]
+        except_sports: Vec<u16>,
         #[serde(default)]
         except: Vec<String>,
     },
@@ -231,6 +239,16 @@ impl Profile {
             self.route_policy(),
             Some((_, Policy::Route { udp_only: true, .. }))
         )
+    }
+
+    /// UDP source ports whose sockets stay unmarked and direct: they existed
+    /// when the route opened, and rerouting a live flow would change its
+    /// game-visible source.
+    pub fn route_except_sports(&self) -> Vec<u16> {
+        match self.route_policy() {
+            Some((_, Policy::Route { except_sports, .. })) => except_sports.clone(),
+            _ => Vec::new(),
+        }
     }
 
     pub fn has_policies(&self) -> bool {

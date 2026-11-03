@@ -81,7 +81,7 @@ pub enum SocketMarkError {
 /// cannot be read, or a socket exists but cannot be marked. A kernel without
 /// `pidfd_getfd` returns [`SocketMarkError::Unsupported`].
 pub fn set_mark(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
-    mark_scope(pid, mark, Scope::All)
+    mark_scope(pid, mark, Scope::All, &[])
 }
 
 /// Marks the datagram (UDP) sockets held by `pid` and leaves every stream
@@ -93,8 +93,8 @@ pub fn set_mark(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
 /// # Errors
 ///
 /// Returns [`SocketMarkError`] under the same conditions as [`set_mark`].
-pub fn set_mark_datagram(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
-    mark_scope(pid, mark, Scope::Datagram)
+pub fn set_mark_datagram(pid: u32, mark: u32, pinned: &[u16]) -> Result<usize, SocketMarkError> {
+    mark_scope(pid, mark, Scope::Datagram, pinned)
 }
 
 /// Which sockets a mark applies to.
@@ -106,21 +106,31 @@ enum Scope {
     Datagram,
 }
 
-fn mark_scope(pid: u32, mark: u32, scope: Scope) -> Result<usize, SocketMarkError> {
+fn mark_scope(pid: u32, mark: u32, scope: Scope, pinned: &[u16]) -> Result<usize, SocketMarkError> {
     let pidfd = open_pidfd(pid)?;
     let mut marked = 0;
     for fd in process_fds(pid)? {
         let Some(socket) = duplicate_socket(pidfd.as_raw_fd(), pid, fd)? else {
             continue;
         };
-        if matches!(scope, Scope::Datagram)
-            && socket_type(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
+        if matches!(scope, Scope::Datagram) {
+            if socket_type(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
                 fd,
                 pid,
                 source,
             })? != Some(libc::SOCK_DGRAM)
-        {
-            continue;
+            {
+                continue;
+            }
+            // A pinned source port is a socket that already existed when the
+            // route opened. Its mark would route the live flow into the tunnel
+            // (the fwmark ip rule reads sk_mark directly), changing the
+            // game-visible source under the game's feet.
+            let local = socket_local_port(socket.as_raw_fd())
+                .map_err(|source| SocketMarkError::Mark { fd, pid, source })?;
+            if local.is_some_and(|port| pinned.contains(&port)) {
+                continue;
+            }
         }
         let current = socket_mark(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
             fd,
@@ -341,6 +351,26 @@ fn socket_type(fd: RawFd) -> io::Result<Option<i32>> {
 }
 
 /// Returns `Some(mark)` for an IPv4/IPv6 socket, `None` for any other fd.
+/// The local port a socket is bound to, if it has one. A UDP socket keeps it
+/// for its whole life, so it identifies the socket across polls.
+fn socket_local_port(fd: RawFd) -> io::Result<Option<u16>> {
+    // SAFETY: `storage` is a plain byte buffer sized for any address family and
+    // `len` names its size; only the first two bytes of a sockaddr are read,
+    // after the kernel reports a length that covers them.
+    unsafe {
+        let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let rc = libc::getsockname(fd, storage.as_mut_ptr().cast(), &mut len);
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let bytes = storage.assume_init_ref();
+        let raw =
+            std::slice::from_raw_parts((bytes as *const libc::sockaddr_storage).cast::<u8>(), 4);
+        Ok(Some(u16::from_be_bytes([raw[2], raw[3]])))
+    }
+}
+
 fn socket_mark(fd: RawFd) -> io::Result<Option<u32>> {
     if !is_inet_socket(fd)? {
         return Ok(None);
@@ -422,12 +452,15 @@ mod tests {
     const MARK: u32 = 0x4e71;
 
     /// The datagram filter a UDP-only route depends on: a mark on the stream
-    /// socket would take its handshake into a tunnel that only carries UDP.
+    /// socket would take its handshake into a tunnel that only carries UDP, and
+    /// a mark on a pre-existing datagram socket would reroute a live flow.
     ///
     /// `sudo cargo test -p netscope-linux --lib -- --ignored udp_only_marks_only_datagram_sockets`
     #[test]
     #[ignore = "requires root: CAP_NET_ADMIN for SO_MARK, pidfd_getfd for the child's fds"]
     fn udp_only_marks_only_datagram_sockets() {
+        use std::io::{BufRead, BufReader};
+
         let euid = {
             // SAFETY: geteuid takes no arguments and cannot fail.
             unsafe { libc::geteuid() }
@@ -437,23 +470,29 @@ mod tests {
             "socket marking needs CAP_NET_ADMIN; run this test as root"
         );
 
-        // One TCP listener and one UDP socket, both held open by the child.
+        // One TCP listener and one UDP socket, both held open by the child. The
+        // child reports the UDP port so the pin can name exactly that socket.
         let mut child = Command::new("python3")
             .args([
                 "-c",
-                "import socket, time\n\
+                "import socket, time, sys\n\
                  t = socket.socket()\n\
                  t.bind(('127.0.0.1', 0)); t.listen()\n\
                  d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
                  d.bind(('127.0.0.1', 0))\n\
+                 print(d.getsockname()[1], flush=True)\n\
                  time.sleep(60)",
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn socket holder");
         let pid = child.id();
+        let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut port_line = String::new();
+        stdout.read_line(&mut port_line).expect("child port");
+        let udp_port: u16 = port_line.trim().parse().expect("a UDP port");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !marks(pid).is_ok_and(|found| found.len() >= 2) {
             assert!(
@@ -464,17 +503,27 @@ mod tests {
         }
 
         assert_eq!(
-            set_mark_datagram(pid, MARK).expect("mark datagram sockets"),
-            1,
-            "a UDP-only route marks the datagram socket only"
+            set_mark_datagram(pid, MARK, &[udp_port]).expect("pinned mark"),
+            0,
+            "a socket pinned at route open must stay unmarked and direct"
         );
-        let carried = marks(pid)
+        assert!(marks(pid)
             .expect("read marks")
-            .into_iter()
-            .filter(|(_, mark)| *mark == MARK)
-            .count();
+            .iter()
+            .all(|(_, mark)| *mark == 0));
+
         assert_eq!(
-            carried, 1,
+            set_mark_datagram(pid, MARK, &[]).expect("mark datagram sockets"),
+            1,
+            "an unpinned UDP-only route marks the datagram socket"
+        );
+        assert_eq!(
+            marks(pid)
+                .expect("read marks")
+                .into_iter()
+                .filter(|(_, mark)| *mark == MARK)
+                .count(),
+            1,
             "no stream socket may carry a UDP-only route mark"
         );
 

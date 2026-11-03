@@ -29,6 +29,7 @@ pub struct AddInput {
     pub allow_ipv6: bool,
     pub udp_only: bool,
     pub except_ports: Vec<u16>,
+    pub except_sports: Vec<u16>,
     pub target_uid: u32,
 }
 
@@ -44,6 +45,7 @@ pub struct ModeInput<'a> {
     pub allow_ipv6: bool,
     pub udp_only: bool,
     pub except_ports: &'a [u16],
+    pub except_sports: &'a [u16],
 }
 
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -123,6 +125,7 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
         allow_ipv6: input.allow_ipv6,
         udp_only: input.udp_only,
         except_ports: &input.except_ports,
+        except_sports: &input.except_sports,
     })?;
     Ok(AddProfile {
         name: input.name,
@@ -143,6 +146,7 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
                 || input.allow_ipv6
                 || input.udp_only
                 || !input.except_ports.is_empty()
+                || !input.except_sports.is_empty()
             {
                 return Err(
                     "--gateway, --gateway6, --include-lan, --allow-ipv6, --udp, and --except-port are only valid with --route"
@@ -219,6 +223,18 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
             if except_ports.contains(&0) {
                 return Err("--except-port must be 1..=65535".to_string());
             }
+            if !input.udp_only && !input.except_sports.is_empty() {
+                return Err("--except-sport requires --udp".to_string());
+            }
+            if input.except_sports.len() > 64 {
+                return Err("--except-sport accepts at most 64 ports".to_string());
+            }
+            let mut except_sports = input.except_sports.to_vec();
+            except_sports.sort_unstable();
+            except_sports.dedup();
+            if except_sports.contains(&0) {
+                return Err("--except-sport must be 1..=65535".to_string());
+            }
             Ok(ModeSpec::Route {
                 interface: interface.to_string(),
                 gateway: input.gateway.map(str::to_string),
@@ -227,6 +243,7 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
                 allow_ipv6: input.allow_ipv6,
                 udp_only: input.udp_only,
                 except_ports,
+                except_sports,
                 except: input.except_cidrs.to_vec(),
             })
         }
@@ -649,6 +666,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .expect("valid filter");
         assert!(matches!(
@@ -671,6 +689,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .expect_err("deny with drop");
         assert!(error.contains("--deny-cidr"));
@@ -691,6 +710,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .is_ok());
         assert!(mode(ModeInput {
@@ -705,6 +725,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .is_err());
     }
@@ -723,6 +744,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .is_err());
 
@@ -738,9 +760,50 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[],
+            except_sports: &[],
         })
         .expect_err("gateway6 without ipv6");
         assert!(error.contains("--allow-ipv6"));
+    }
+
+    #[test]
+    fn udp_route_carries_its_source_port_pins() {
+        let spec = mode(ModeInput {
+            filter: None,
+            route: Some("tun0"),
+            allow_cidrs: &[],
+            deny_cidrs: &[],
+            except_cidrs: &[],
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+            udp_only: true,
+            except_ports: &[],
+            except_sports: &[52665, 49227, 52665],
+        })
+        .expect("valid udp route");
+        match spec {
+            ModeSpec::Route { except_sports, .. } => assert_eq!(except_sports, vec![49227, 52665]),
+            _ => panic!("expected route"),
+        }
+
+        let error = mode(ModeInput {
+            filter: None,
+            route: Some("tun0"),
+            allow_cidrs: &[],
+            deny_cidrs: &[],
+            except_cidrs: &[],
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6: false,
+            udp_only: false,
+            except_ports: &[],
+            except_sports: &[52665],
+        })
+        .expect_err("a source pin only means something on a UDP route");
+        assert!(error.contains("--except-sport requires --udp"));
     }
 
     #[test]
@@ -757,6 +820,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: true,
             except_ports: &[53, 53, 0],
+            except_sports: &[],
         })
         .expect_err("port zero is invalid");
         assert!(spec.contains("1..=65535"));
@@ -773,6 +837,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: true,
             except_ports: &[53, 1900, 53],
+            except_sports: &[],
         })
         .expect("valid udp route");
         match spec {
@@ -799,6 +864,7 @@ mod tests {
             allow_ipv6: false,
             udp_only: false,
             except_ports: &[53],
+            except_sports: &[],
         })
         .is_err());
     }

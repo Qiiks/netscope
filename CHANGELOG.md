@@ -1,3 +1,25 @@
+## Unreleased
+
+### Fixed
+
+- A UDP-only route marks only datagram sockets. `SO_MARK` is protocol-agnostic
+  and the fwmark ip rule reads it directly, so a marked TCP socket sent its
+  handshake into a route that carries only datagrams. Games lost their auth
+  connections while gameplay traffic kept working.
+- `open` no longer marks the target's sockets before its policy arrives: the
+  scope is created first and the policy is set in a second request, so the
+  first attach used to mark every socket with a bare route mark.
+- A marking pass that marked nothing stays retryable, so a later policy change
+  or a socket created in the same pass is still marked.
+
+### Added
+
+- `--except-sport` pins UDP source ports (route policies carry
+  `except_sports`). A socket that already had a flow when the route opened stays
+  direct — rerouting a live flow changes its game-visible source and the game
+  server drops the session. Pinned sockets are never `SO_MARK`ed, and the nft
+  selector accepts them ahead of the mark rule.
+
 # Changelog
 
 ## Unreleased

@@ -158,6 +158,10 @@ struct AddArgs {
     /// UDP destination port that stays direct (repeatable)
     #[arg(long = "except-port", value_name = "PORT", requires = "route")]
     except_port: Vec<u16>,
+    /// UDP source port that already had a flow when the route opened and must
+    /// stay direct (repeatable)
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    except_sport: Vec<u16>,
 }
 
 #[derive(Args)]
@@ -210,6 +214,10 @@ struct OpenArgs {
     /// UDP destination port that stays direct (repeatable)
     #[arg(long = "except-port", value_name = "PORT", requires = "route")]
     except_port: Vec<u16>,
+    /// UDP source port that already had a flow when the route opened and must
+    /// stay direct (repeatable)
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    except_sport: Vec<u16>,
 }
 
 #[derive(Args)]
@@ -252,6 +260,10 @@ struct PolicyArgs {
     /// UDP destination port that stays direct (repeatable)
     #[arg(long = "except-port", value_name = "PORT", requires = "route")]
     except_port: Vec<u16>,
+    /// UDP source port that already had a flow when the route opened and must
+    /// stay direct (repeatable)
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    except_sport: Vec<u16>,
 }
 
 fn main() {
@@ -340,6 +352,7 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
         allow_ipv6: args.allow_ipv6,
         udp_only: args.udp,
         except_ports: args.except_port,
+        except_sports: args.except_sport,
         target_uid,
     };
     match commands::build_add(input) {
@@ -376,6 +389,7 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
         allow_ipv6: args.allow_ipv6,
         udp_only: args.udp,
         except_ports: args.except_port.clone(),
+        except_sports: args.except_sport.clone(),
         target_uid,
     };
     let target = match commands::build_target(&input) {
@@ -395,6 +409,7 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
             allow_ipv6: args.allow_ipv6,
             udp_only: args.udp,
             except_ports: &args.except_port,
+            except_sports: &args.except_sport,
         }) {
             Ok(policy) => Some(policy),
             Err(message) => return usage(&message),
@@ -428,6 +443,7 @@ fn policy(args: PolicyArgs, socket: &Path) -> i32 {
         allow_ipv6: args.allow_ipv6,
         udp_only: args.udp,
         except_ports: &args.except_port,
+        except_sports: &args.except_sport,
     }) {
         Ok(policy) => policy,
         Err(message) => return usage(&message),

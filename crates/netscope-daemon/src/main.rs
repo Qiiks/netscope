@@ -1066,10 +1066,18 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
 
 fn mark_sockets(profile: &Profile, pid: u32) -> bool {
     let id = &profile.id;
+    // `open` creates the scope before its policy arrives: marking then is
+    // marking with no policy at all, which used to mark every socket of the
+    // target (including TCP) with the bare route mark. The policy's `set`
+    // re-runs `attach_matches`, so the real marking happens once the policy is
+    // known.
+    if !profile.has_policies() {
+        return false;
+    }
     // A UDP-only route must not mark TCP sockets: the mark applies to every
     // packet the socket sends, and the tunnel only carries datagrams.
     let result = if profile.route_is_udp_only() {
-        sockets::set_mark_datagram(pid, profile.mark)
+        sockets::set_mark_datagram(pid, profile.mark, &profile.route_except_sports())
     } else {
         sockets::set_mark(pid, profile.mark)
     };
@@ -1081,7 +1089,10 @@ fn mark_sockets(profile: &Profile, pid: u32) -> bool {
                     profile.route_is_udp_only()
                 );
             }
-            true
+            // A pass that marked nothing (no sockets yet, or every socket
+            // pinned) must stay retryable: a later policy change or a later
+            // socket would otherwise never be marked.
+            count > 0
         }
         Err(SocketMarkError::ProcessGone(_)) => true,
         Err(err) => {
@@ -2947,6 +2958,7 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             allow_ipv6,
             udp_only,
             except_ports,
+            except_sports,
             except,
         } => {
             if interface.is_empty()
@@ -2991,6 +3003,18 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             if !*udp_only && !ports.is_empty() {
                 return Err("except_ports requires udp_only".to_string());
             }
+            if except_sports.len() > 64 {
+                return Err("route policy accepts at most 64 exception source ports".to_string());
+            }
+            let mut sports = except_sports.clone();
+            sports.sort_unstable();
+            sports.dedup();
+            if sports.contains(&0) {
+                return Err("route exception source ports must be 1..=65535".to_string());
+            }
+            if !*udp_only && !sports.is_empty() {
+                return Err("except_sports requires udp_only".to_string());
+            }
             let mut normalized = Vec::with_capacity(except.len());
             for cidr in except {
                 let canonical = parse_cidr(cidr)?;
@@ -3007,6 +3031,7 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
                 allow_ipv6: *allow_ipv6,
                 udp_only: *udp_only,
                 except_ports: ports,
+                except_sports: sports,
                 except: normalized,
             })
         }

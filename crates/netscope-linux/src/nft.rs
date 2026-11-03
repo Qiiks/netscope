@@ -160,6 +160,7 @@ impl NftManager {
                 allow_ipv6,
                 udp_only,
                 except_ports,
+                except_sports,
                 ..
             },
         )) = profile.route_policy()
@@ -185,6 +186,16 @@ impl NftManager {
                         .join(", ");
                     rules.push(format!(
                         "meta nfproto ipv4 meta l4proto udp udp dport {{ {ports} }} accept"
+                    ));
+                }
+                if !except_sports.is_empty() {
+                    let sports = except_sports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    rules.push(format!(
+                        "meta nfproto ipv4 meta l4proto udp udp sport {{ {sports} }} accept"
                     ));
                 }
                 "meta nfproto ipv4 meta l4proto udp "
@@ -359,6 +370,7 @@ mod tests {
                     allow_ipv6: false,
                     udp_only: false,
                     except_ports: Vec::new(),
+                    except_sports: Vec::new(),
                     except: Vec::new(),
                 },
             ),
@@ -383,6 +395,7 @@ mod tests {
                 allow_ipv6: false,
                 udp_only: true,
                 except_ports: vec![53, 1900],
+                except_sports: Vec::new(),
                 except: Vec::new(),
             },
         )]);
@@ -395,6 +408,38 @@ mod tests {
                 .any(|line| line.contains("counter meta mark set")
                     && !line.contains("meta l4proto udp")),
             "the UDP selector must be part of the mark rule"
+        );
+    }
+
+    #[test]
+    fn a_udp_route_pins_existing_source_ports_before_the_mark() {
+        let manager = NftManager::new(Path::new("/sys/fs/cgroup/netscope")).unwrap();
+        let profile = profile(vec![(
+            "exitlink",
+            Policy::Route {
+                interface: "tun0".to_string(),
+                gateway: None,
+                gateway6: None,
+                include_lan: false,
+                allow_ipv6: false,
+                udp_only: true,
+                except_ports: Vec::new(),
+                except_sports: vec![52665, 49227],
+                except: Vec::new(),
+            },
+        )]);
+        let body = NftManager::render_body(&profile, &manager.profile_selectors(&profile)).unwrap();
+        let sport_rule = body
+            .lines()
+            .position(|line| line.contains("udp sport { 52665, 49227 } accept"))
+            .expect("existing source ports stay direct");
+        let mark_rule = body
+            .lines()
+            .position(|line| line.contains("counter meta mark set 0x4e53"))
+            .expect("other flows are marked");
+        assert!(
+            sport_rule < mark_rule,
+            "the pin must run before the mark, or the live flow is rerouted"
         );
     }
 
@@ -419,6 +464,7 @@ mod tests {
                     allow_ipv6: false,
                     udp_only: false,
                     except_ports: Vec::new(),
+                    except_sports: Vec::new(),
                     except: Vec::new(),
                 },
             ),
