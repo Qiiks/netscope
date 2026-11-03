@@ -1020,7 +1020,6 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
     if !profile.enabled {
         return;
     }
-    let mark = profile.mark;
     let already_attached = rt.cgroup.procs(id).is_ok_and(|pids| pids.contains(&pid));
     if already_attached {
         if matches!(
@@ -1031,7 +1030,7 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
         }
         inner.provenance.entry(pid).or_insert(source);
         if !inner.marked.get(id).is_some_and(|pids| pids.contains(&pid))
-            && mark_sockets(id, mark, pid)
+            && mark_sockets(&profile, pid)
         {
             inner.marked.entry(id.to_string()).or_default().insert(pid);
         }
@@ -1045,7 +1044,7 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
                     .get(id)
                     .is_some_and(|pids| pids.contains(&tgid))
                 {
-                    mark_sockets(id, mark, tgid);
+                    mark_sockets(&profile, tgid);
                     inner.marked.entry(id.to_string()).or_default().insert(tgid);
                 }
                 inner.provenance.insert(tgid, source);
@@ -1065,11 +1064,22 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
     }
 }
 
-fn mark_sockets(id: &str, mark: u32, pid: u32) -> bool {
-    match sockets::set_mark(pid, mark) {
+fn mark_sockets(profile: &Profile, pid: u32) -> bool {
+    let id = &profile.id;
+    // A UDP-only route must not mark TCP sockets: the mark applies to every
+    // packet the socket sends, and the tunnel only carries datagrams.
+    let result = if profile.route_is_udp_only() {
+        sockets::set_mark_datagram(pid, profile.mark)
+    } else {
+        sockets::set_mark(pid, profile.mark)
+    };
+    match result {
         Ok(count) => {
             if count > 0 {
-                info!("marked profile={id} pid={pid} sockets={count}");
+                info!(
+                    "marked profile={id} pid={pid} sockets={count} udp_only={}",
+                    profile.route_is_udp_only()
+                );
             }
             true
         }
@@ -1603,7 +1613,7 @@ fn attach_event(
             .get(&profile.id)
             .is_some_and(|pids| pids.contains(&pid))
         {
-            mark_sockets(&profile.id, profile.mark, pid);
+            mark_sockets(profile, pid);
             inner
                 .marked
                 .entry(profile.id.clone())
@@ -1625,7 +1635,7 @@ fn attach_event(
                     .get(&profile.id)
                     .is_some_and(|pids| pids.contains(&outcome.tgid))
                 {
-                    mark_sockets(&profile.id, profile.mark, outcome.tgid);
+                    mark_sockets(profile, outcome.tgid);
                     inner
                         .marked
                         .entry(profile.id.clone())

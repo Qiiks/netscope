@@ -223,6 +223,16 @@ impl Profile {
         self.route_policy().is_some()
     }
 
+    /// True when the profile routes and that route is scoped to UDP. Socket
+    /// marking must follow it: a mark on a TCP socket would route a
+    /// handshake into a UDP-only interface.
+    pub fn route_is_udp_only(&self) -> bool {
+        matches!(
+            self.route_policy(),
+            Some((_, Policy::Route { udp_only: true, .. }))
+        )
+    }
+
     pub fn has_policies(&self) -> bool {
         !self.policies.is_empty()
     }

@@ -19,6 +19,10 @@
 
 ### Fixed
 
+- A UDP-only route no longer marks TCP sockets. `SO_MARK` is protocol-agnostic,
+  so a marked stream socket took the fwmark into the UDP-only route and its
+  handshake was lost — a game's auth connection dropped while the tunnel was
+  up. Datagram sockets are now the only ones marked for `--udp` profiles.
 - The daemon's seccomp allow-list now includes `pidfd_getfd`. `clear_mark_all`
   uses it on the first reconcile; the hardened unit previously killed
   `netscoped` with `SIGSYS` before it served a request, leaving ExitLink on its

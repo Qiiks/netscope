@@ -63,10 +63,17 @@ pub enum SocketMarkError {
 
 /// Marks every IPv4 and IPv6 socket currently held by `pid`.
 ///
+/// [`set_mark_datagram`] restricts marking to datagram (UDP) sockets. [`SO_MARK`] is
+/// protocol-agnostic, so a marked TCP socket would take the same fwmark into a
+/// UDP-only route — its handshake would be swallowed by the tunnel. A
+/// UDP-only profile therefore marks only UDP sockets.
+///
 /// Returns the number of sockets that now carry `mark`. Sockets that already
 /// carry it are counted. Failure to reach one descriptor is reported rather
 /// than skipped, because a partial mark would leave the profile silently
 /// incomplete.
+///
+/// [`SO_MARK`]: https://man7.org/linux/man-pages/man7/socket.7.html
 ///
 /// # Errors
 ///
@@ -74,12 +81,47 @@ pub enum SocketMarkError {
 /// cannot be read, or a socket exists but cannot be marked. A kernel without
 /// `pidfd_getfd` returns [`SocketMarkError::Unsupported`].
 pub fn set_mark(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
+    mark_scope(pid, mark, Scope::All)
+}
+
+/// Marks the datagram (UDP) sockets held by `pid` and leaves every stream
+/// socket untouched.
+///
+/// A UDP-only route carries datagrams only: a marked TCP socket would send its
+/// handshake into that route and lose it.
+///
+/// # Errors
+///
+/// Returns [`SocketMarkError`] under the same conditions as [`set_mark`].
+pub fn set_mark_datagram(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
+    mark_scope(pid, mark, Scope::Datagram)
+}
+
+/// Which sockets a mark applies to.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// Every IPv4/IPv6 socket, the default for a route that carries all traffic.
+    All,
+    /// Datagram sockets only, for a route scoped to UDP.
+    Datagram,
+}
+
+fn mark_scope(pid: u32, mark: u32, scope: Scope) -> Result<usize, SocketMarkError> {
     let pidfd = open_pidfd(pid)?;
     let mut marked = 0;
     for fd in process_fds(pid)? {
         let Some(socket) = duplicate_socket(pidfd.as_raw_fd(), pid, fd)? else {
             continue;
         };
+        if matches!(scope, Scope::Datagram)
+            && socket_type(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
+                fd,
+                pid,
+                source,
+            })? != Some(libc::SOCK_DGRAM)
+        {
+            continue;
+        }
         let current = socket_mark(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
             fd,
             pid,
@@ -271,6 +313,33 @@ fn duplicate_socket(pidfd: RawFd, pid: u32, fd: i32) -> Result<Option<OwnedFd>, 
     Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
 }
 
+/// Returns the socket's `SO_TYPE` (`SOCK_DGRAM`, `SOCK_STREAM`, …), or `None`
+/// when the descriptor is not a socket.
+fn socket_type(fd: RawFd) -> io::Result<Option<i32>> {
+    let mut kind: libc::c_int = 0;
+    let mut len = socklen::<libc::c_int>();
+    // SAFETY: `fd` is an open descriptor and the kernel writes one c_int into
+    // `kind`; `len` is its exact size and is updated by the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(kind).cast(),
+            &raw mut len,
+        )
+    };
+    if rc == 0 {
+        return Ok(Some(kind));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOTSOCK) {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
 /// Returns `Some(mark)` for an IPv4/IPv6 socket, `None` for any other fd.
 fn socket_mark(fd: RawFd) -> io::Result<Option<u32>> {
     if !is_inet_socket(fd)? {
@@ -341,4 +410,81 @@ fn set_socket_mark(fd: RawFd, mark: u32) -> io::Result<()> {
 
 fn socklen<T>() -> libc::socklen_t {
     libc::socklen_t::try_from(std::mem::size_of::<T>()).expect("socket option size fits socklen_t")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const MARK: u32 = 0x4e71;
+
+    /// The datagram filter a UDP-only route depends on: a mark on the stream
+    /// socket would take its handshake into a tunnel that only carries UDP.
+    ///
+    /// `sudo cargo test -p netscope-linux --lib -- --ignored udp_only_marks_only_datagram_sockets`
+    #[test]
+    #[ignore = "requires root: CAP_NET_ADMIN for SO_MARK, pidfd_getfd for the child's fds"]
+    fn udp_only_marks_only_datagram_sockets() {
+        let euid = {
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            unsafe { libc::geteuid() }
+        };
+        assert_eq!(
+            euid, 0,
+            "socket marking needs CAP_NET_ADMIN; run this test as root"
+        );
+
+        // One TCP listener and one UDP socket, both held open by the child.
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import socket, time\n\
+                 t = socket.socket()\n\
+                 t.bind(('127.0.0.1', 0)); t.listen()\n\
+                 d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+                 d.bind(('127.0.0.1', 0))\n\
+                 time.sleep(60)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn socket holder");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marks(pid).is_ok_and(|found| found.len() >= 2) {
+            assert!(
+                Instant::now() < deadline,
+                "the holder never opened both sockets"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            set_mark_datagram(pid, MARK).expect("mark datagram sockets"),
+            1,
+            "a UDP-only route marks the datagram socket only"
+        );
+        let carried = marks(pid)
+            .expect("read marks")
+            .into_iter()
+            .filter(|(_, mark)| *mark == MARK)
+            .count();
+        assert_eq!(
+            carried, 1,
+            "no stream socket may carry a UDP-only route mark"
+        );
+
+        assert_eq!(
+            set_mark(pid, MARK).expect("mark every socket"),
+            2,
+            "a route that is not UDP-only marks both sockets"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
