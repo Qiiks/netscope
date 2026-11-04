@@ -158,8 +158,8 @@ to the route mark.
 
 ```sh
 sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
-sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
-  --allow-cidr 34.0.0.0/8
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter allow \
+  --deny-cidr 64.224.26.0/23
 sudo netscope policy overwatch --consumer exitlink --route tun0 \
   --except 203.0.113.0/24
 sudo netscope close overwatch --consumer dropship

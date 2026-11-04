@@ -120,8 +120,8 @@ When two programs need the same app, name it once per consumer with `open`; a se
 
 ```sh
 sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
-sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
-  --allow-cidr 34.0.0.0/8
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter allow \
+  --deny-cidr 64.224.26.0/23
 ```
 
 Both consumers get the same profile and cgroup. Each owns its own policy; the last `netscope close <profile> --consumer <id>` removes the scope. See [Shared scopes](shared-scopes.md).

@@ -32,8 +32,8 @@ removes it.
 
 ```sh
 sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
-sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
-  --allow-cidr 34.0.0.0/8
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter allow \
+  --deny-cidr 64.224.26.0/23
 ```
 
 Both commands return the same profile. An API client that keeps its control
@@ -67,7 +67,7 @@ any number of filter policies:
 | Consumer | Policy | Effect |
 |---|---|---|
 | exitlink | route `tun0` | mark packets for the tunnel table |
-| dropship | filter drop, allow `34.0.0.0/8` | drop everything except the listed destinations |
+| dropship | filter allow, deny `64.224.26.0/23` | drop only the listed destinations; everything else falls through |
 
 A second consumer cannot take the route: route ownership is exclusive. Filters
 compose before the route mark: a drop from any filter is terminal for that
