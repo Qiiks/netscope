@@ -40,7 +40,7 @@ netscope status [--json]
 Prints the daemon version, pid, kernel, cgroup root, and one row per profile. The text form has a daemon header and the same columns as `list`:
 
 ```text
-DAEMON  netscoped 0.2.0  pid 1234  kernel 6.11.0-arch1-1
+DAEMON  netscoped 0.2.1  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
 NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          PIDS
 blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        4242
@@ -90,6 +90,7 @@ Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` 
 | `--allow-ipv6` | `--route` | Carry IPv6; without it, IPv6 is dropped. |
 | `--udp` | `--route` | Mark only IPv4 UDP; TCP keeps its normal route. |
 | `--except-port <port>` | `--route --udp` | UDP destination port that stays direct. Repeatable, up to 32. |
+| `--except-sport <port>` | `--route --udp` | UDP source port pinned direct. Repeatable, up to 64. |
 | `--except <cidr>` | `--route` | Destination that stays direct. Repeatable, up to 30. |
 
 Rules enforced before the daemon is asked:
@@ -102,8 +103,9 @@ Rules enforced before the daemon is asked:
 - `--deny-cidr` is rejected with `--filter drop`, and `--filter allow` needs at least one.
 - `--gateway` is rejected outside `--route`.
 - `--gateway6` is rejected without `--allow-ipv6`.
-- `--include-lan`, `--allow-ipv6`, `--udp`, `--except-port`, and `--except` are rejected outside `--route`.
+- `--include-lan`, `--allow-ipv6`, `--udp`, `--except-port`, `--except-sport`, and `--except` are rejected outside `--route`.
 - `--except-port` requires `--udp` and takes 32 ports; port `0` is rejected.
+- `--except-sport` requires `--udp` and takes 64 ports; port `0` is rejected. Pinned sockets are never marked and their packets are accepted before the mark rule, so a flow that already existed when the profile opened keeps its normal route. A socket keeps its source port for its whole life, so the pin holds until the process exits.
 - `--except` takes up to 30 CIDRs. The daemon installs each as an `ip rule` to `main` at a lower priority than the mark rule.
 
 On success the daemon creates the cgroup, the nftables table, and, for route profiles, the policy rule and routes. If the app was already running and got attached late, the CLI prints:

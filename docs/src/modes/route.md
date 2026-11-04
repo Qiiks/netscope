@@ -19,6 +19,7 @@ The interface must already exist and be up. If it does not, the daemon fails to 
 | `--allow-ipv6` | Carry IPv6 through the profile. Without it, all IPv6 from the profile is dropped. |
 | `--udp` | Mark only IPv4 UDP. TCP keeps its normal route, so a TCP proxy can own TCP on the same process. |
 | `--except-port <port>` | UDP destination port that stays direct. Repeatable, up to 32; requires `--udp`. |
+| `--except-sport <port>` | UDP source port pinned direct. Repeatable, up to 64; requires `--udp`. |
 | `--except <cidr>` | Destination that stays direct. Repeatable, up to 30. The daemon installs an `ip rule` to `main` at a lower priority than the mark rule. Loopback is always kept direct the same way and does not count against the 30. |
 
 `--gateway` and `--gateway6` are mutually exclusive with the wrong family: `--gateway6` requires `--allow-ipv6`, and `--gateway` is IPv4 only.
@@ -30,7 +31,9 @@ The nftables chain for a route profile:
 1. accepts loopback (`127.0.0.0/8`, `::1/128`);
 2. unless `--include-lan`, accepts the LAN and link-local ranges listed below;
 3. unless `--allow-ipv6`, drops all IPv6;
-4. with `--udp`, accepts the `--except-port` destinations and then sets the mark on IPv4 UDP only; without it, sets the mark on everything left.
+4. with `--udp`, accepts the `--except-port` destinations and the `--except-sport` sources, then sets the mark on IPv4 UDP only; without it, sets the mark on everything left.
+
+`--except-sport` exists for a route that opens over a live flow. A UDP socket keeps its source port for its whole life, and the mark applies to every packet it sends, so marking one mid-session moves the flow to the tunnel and changes the source address the peer sees. Pinning the source port leaves that socket on its normal route; sockets created afterwards are marked and routed as usual. The daemon never marks a pinned socket, so the pin survives later attaches.
 
 The mark is then matched by an `ip rule`:
 

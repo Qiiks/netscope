@@ -113,7 +113,7 @@ No. It relies on Linux cgroup v2, fanotify, nftables, and policy routing.
 
 ## Does it work with Flatpak or Snap applications?
 
-Not tested in v0.2.0. Sandboxed applications may run in a different cgroup or mount namespace, and the executable path you see outside the sandbox may not be the path the daemon matches. Use `netscope status` to see whether the process was attached, and report a reproducible case.
+Not tested in v0.2.1. Sandboxed applications may run in a different cgroup or mount namespace, and the executable path you see outside the sandbox may not be the path the daemon matches. Use `netscope status` to see whether the process was attached, and report a reproducible case.
 
 ## What license is it under?
 
