@@ -63,6 +63,26 @@ sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe 
 Both consumers get the same profile and cgroup. Each owns its own policy; the
 last `netscope close` removes the scope. See [shared scopes](docs/src/shared-scopes.md).
 
+## Developer SDK & Protocol
+
+Two programs can share one process through the [`netscope-client`](crates/netscope-client)
+Rust crate, or speak the daemon protocol directly from any language.
+
+```rust
+use netscope_client::{Client, Hold};
+
+fn main() -> Result<(), netscope_client::ClientError> {
+    let mut client = Client::connect()?;
+    let scope = client.open_process("exitlink", "Overwatch.exe", 1000, Hold::Peer)?;
+    client.close_scope(&scope.profile, "exitlink")
+}
+```
+
+The daemon accepts newline-delimited JSON on
+`/run/netscope/control.sock`. The full envelope, every operation, hold
+semantics, and copy-pasteable Python, Go, C, and shell clients are in
+[Daemon protocol & SDK](docs/src/protocol.md).
+
 ## How it works
 
 1. `fanotify` holds an `exec` of a selected native inode — or the first open of a selected Windows PE by a Wine/Proton loader — until the daemon has moved the process into `/sys/fs/cgroup/netscope/<profile>`.

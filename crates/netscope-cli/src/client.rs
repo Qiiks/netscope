@@ -1,12 +1,9 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use netscope_linux::protocol::{
-    Request, RequestOp, Response, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-};
+use netscope_client::Client;
+use netscope_linux::protocol::RequestOp;
 use netscope_linux::types::Config;
 use serde_json::Value;
 
@@ -14,9 +11,6 @@ pub const CONFIG_PATH: &str = "/etc/netscope/config.toml";
 pub const UNAVAILABLE: &str = "daemon not running; start with: sudo systemctl start netscoped";
 pub const GROUP_HINT: &str =
     "permission denied; add your user to the netscope group: sudo usermod -aG netscope $USER";
-
-const REQUEST_ID: u64 = 1;
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -41,6 +35,23 @@ impl ClientError {
             | Self::Permission(message)
             | Self::Failed(message)
             | Self::Protocol(message) => message,
+        }
+    }
+}
+
+impl From<netscope_client::ClientError> for ClientError {
+    fn from(err: netscope_client::ClientError) -> Self {
+        use netscope_client::ClientError as Upstream;
+        match err {
+            Upstream::Unavailable(message) => Self::Unavailable(message),
+            Upstream::Permission(message) => Self::Permission(message),
+            Upstream::Daemon(message) if message.starts_with("permission denied") => {
+                Self::Permission(message)
+            }
+            Upstream::Daemon(message) => Self::Failed(message),
+            Upstream::Protocol(message) => Self::Protocol(message),
+            Upstream::Io(err) => io_error(err),
+            other => Self::Failed(other.to_string()),
         }
     }
 }
@@ -80,69 +91,8 @@ pub fn socket_path(override_path: Option<&Path>) -> PathBuf {
 }
 
 pub fn send(socket: &Path, op: RequestOp) -> Result<Option<Value>, ClientError> {
-    let request = Request { id: REQUEST_ID, op };
-    let mut line = serde_json::to_vec(&request)
-        .map_err(|err| ClientError::Failed(format!("encode request: {err}")))?;
-    if line.len() > MAX_REQUEST_BYTES {
-        return Err(ClientError::Failed(format!(
-            "request exceeds {MAX_REQUEST_BYTES} bytes"
-        )));
-    }
-    line.push(b'\n');
-
-    let mut stream = UnixStream::connect(socket).map_err(|err| connect_error(socket, err))?;
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|err| ClientError::Failed(format!("set read timeout: {err}")))?;
-    stream
-        .set_write_timeout(Some(TIMEOUT))
-        .map_err(|err| ClientError::Failed(format!("set write timeout: {err}")))?;
-    stream
-        .write_all(&line)
-        .and_then(|()| stream.flush())
-        .map_err(io_error)?;
-
-    let mut response = Vec::new();
-    let mut reader = BufReader::new(&stream).take((MAX_RESPONSE_BYTES + 1) as u64);
-    reader.read_until(b'\n', &mut response).map_err(io_error)?;
-    if response.is_empty() {
-        return Err(ClientError::Failed(
-            "daemon closed the connection without a response".to_string(),
-        ));
-    }
-    if response.last() == Some(&b'\n') {
-        response.pop();
-    }
-    if response.len() > MAX_RESPONSE_BYTES {
-        return Err(ClientError::Protocol(format!(
-            "response exceeds {MAX_RESPONSE_BYTES} bytes"
-        )));
-    }
-
-    let response: Response = serde_json::from_slice(&response).map_err(|err| {
-        ClientError::Protocol(format!("invalid response from daemon (id 0): {err}"))
-    })?;
-    if !response.ok {
-        let error = response
-            .error
-            .unwrap_or_else(|| "daemon returned an error without a message".to_string());
-        return Err(if error.starts_with("permission denied") {
-            ClientError::Permission(error)
-        } else {
-            ClientError::Failed(error)
-        });
-    }
-    Ok(response.data)
-}
-
-fn connect_error(socket: &Path, err: io::Error) -> ClientError {
-    match err.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
-            ClientError::Unavailable(UNAVAILABLE.to_string())
-        }
-        io::ErrorKind::PermissionDenied => ClientError::Permission(GROUP_HINT.to_string()),
-        _ => ClientError::Failed(format!("connect {}: {err}", socket.display())),
-    }
+    let mut client = Client::connect_at(socket)?;
+    client.raw_request(op).map_err(ClientError::from)
 }
 
 fn io_error(err: io::Error) -> ClientError {
@@ -202,5 +152,57 @@ mod tests {
         fs::remove_file(&path).expect("remove temp config");
         assert_eq!(config.daemon.socket_path, defaults.daemon.socket_path);
         assert_eq!(config.daemon.max_profiles, defaults.daemon.max_profiles);
+    }
+
+    fn temp_socket(name: &str) -> (PathBuf, std::os::unix::net::UnixListener) {
+        let path = std::env::temp_dir().join(format!(
+            "netscope-cli-socket-{}-{name}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind mock socket");
+        (path, listener)
+    }
+
+    #[test]
+    fn send_round_trips_through_the_sdk() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (path, listener) = temp_socket("send");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone mock stream"))
+                .read_line(&mut line)
+                .expect("read request");
+            let request: netscope_linux::protocol::Request =
+                serde_json::from_str(line.trim_end()).expect("decode request");
+            assert_eq!(request.op, RequestOp::Status);
+            let response = netscope_linux::protocol::Response::ok(
+                request.id,
+                serde_json::json!({"api_version": 2}),
+            );
+            let line = serde_json::to_string(&response).expect("encode response");
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .expect("write response");
+        });
+
+        let data = send(&path, RequestOp::Status).expect("send status");
+        handle.join().expect("mock responder");
+        fs::remove_file(&path).expect("remove mock socket");
+        assert_eq!(
+            data.expect("status data")["api_version"],
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn daemon_permission_error_keeps_exit_code_four() {
+        let err = ClientError::from(netscope_client::ClientError::Daemon(
+            "permission denied: profile owned by uid 0".to_string(),
+        ));
+        assert_eq!(err.exit_code(), 4);
+        assert_eq!(err.message(), "permission denied: profile owned by uid 0");
     }
 }

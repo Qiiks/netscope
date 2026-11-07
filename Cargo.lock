@@ -302,12 +302,23 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "netscope-client",
  "netscope-linux",
  "serde_json",
  "tar",
  "time",
  "toml",
  "zstd",
+]
+
+[[package]]
+name = "netscope-client"
+version = "0.2.1"
+dependencies = [
+ "netscope-linux",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

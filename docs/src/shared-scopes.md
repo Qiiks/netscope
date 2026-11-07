@@ -114,6 +114,9 @@ replaces that consumer's policy atomically and rolls back on failure. The
 daemon serializes every cgroup, nftables, and routing mutation behind one lock,
 so two consumers cannot interleave a half-written ruleset.
 
+Full schema, error semantics, every operation, and multi-language client
+examples are in [Daemon Protocol & SDK](protocol.md).
+
 ## Limits
 
 - A name target attaches every process with that name under the target UID.

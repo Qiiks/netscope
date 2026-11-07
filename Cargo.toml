@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/netscope-linux", "crates/netscope-daemon", "crates/netscope-cli"]
+members = [
+    "crates/netscope-linux",
+    "crates/netscope-daemon",
+    "crates/netscope-cli",
+    "crates/netscope-client",
+]
 
 [workspace.package]
 version = "0.2.1"
