@@ -328,6 +328,12 @@ derives one from the target and UID, for example `overwatch-u1000`.
 `ScopeHandle` fields: `profile`, `generation`, `target`, `target_uid`,
 `state` (`active` or `disabled`), `attached`, `pids`, `consumers`.
 
+A named target that already has a scope merges the new claim into that existing
+profile, so the `profile` in the response is the authoritative id and may
+differ from the `name` you asked for: address every later `set_policy` and
+`close` to the returned id. Closing by the requested name leaves the claim and
+its policy behind in the shared scope.
+
 Opening a name target also installs the Wine/Proton loader holds, so the next
 launch is moved into the cgroup before its first socket. A running process is
 attached on the poll and its existing sockets are marked.
