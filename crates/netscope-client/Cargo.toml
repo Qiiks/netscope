@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Typed Rust client for the netscope daemon control socket"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
 netscope-linux = { version = "0.2.1", path = "../netscope-linux" }

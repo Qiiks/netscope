@@ -12,6 +12,8 @@ version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.82"
+repository = "https://github.com/Qiiks/netscope"
+homepage = "https://qiiks.github.io/netscope"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"          # each unsafe op needs its own unsafe block

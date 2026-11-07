@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Per-application network scoping primitives for Linux"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
