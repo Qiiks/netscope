@@ -4,6 +4,7 @@
 - [Install](install.md)
 - [Quick start](quickstart.md)
 - [How it works](how-it-works.md)
+- [Architecture & Decisions](architecture.md)
 - [Shared scopes](shared-scopes.md)
 - [Daemon Protocol & SDK](protocol.md)
 - [Filter mode](modes/filter.md)
