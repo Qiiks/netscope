@@ -56,8 +56,8 @@ Two programs can share one process without fighting over its cgroup:
 
 ```sh
 sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch --process Overwatch.exe --route tun0
-sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter drop \
-  --allow-cidr 34.0.0.0/8
+sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe --filter allow \
+  --deny-cidr 34.142.0.0/16
 ```
 
 Both consumers get the same profile and cgroup. Each owns its own policy; the
@@ -65,9 +65,8 @@ last `netscope close` removes the scope. See [shared scopes](docs/src/shared-sco
 
 ## Developer SDK & Protocol
 
-Two programs can share one process through the [`netscope-client`](crates/netscope-client)
-Rust crate, or speak the daemon protocol directly from any language.
-
+Two programs can share one process through the [`netscope-client`](https://crates.io/crates/netscope-client)
+crate (`cargo add netscope-client`), or speak the daemon protocol directly from any language.
 ```rust
 use netscope_client::{Client, Hold};
 
