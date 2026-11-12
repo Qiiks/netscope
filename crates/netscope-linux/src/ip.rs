@@ -5,7 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::command::run;
-use crate::types::{Policy, Profile, ProfileId, TABLE_BASE};
+use crate::types::{Policy, Profile, ProfileId, RouteLink, TABLE_BASE};
 
 #[derive(Debug, Error)]
 pub enum IpError {
@@ -67,7 +67,14 @@ fn ensure_rule_for_family(
     Ok(())
 }
 
-pub fn ensure(profile: &Profile) -> Result<(), IpError> {
+/// Install the rules and the blackhole plus the winner's tunnel default.
+/// `None` leaves no tunnel default, which is what all links down means.
+///
+/// # Errors
+///
+/// Returns [`IpError`] when an `ip` command fails or the policy carries too
+/// many exceptions.
+pub fn ensure_for(profile: &Profile, winner: Option<&RouteLink>) -> Result<(), IpError> {
     let Some(Policy::Route {
         allow_ipv6, except, ..
     }) = route(profile)
@@ -77,13 +84,13 @@ pub fn ensure(profile: &Profile) -> Result<(), IpError> {
     if except.len() > 30 {
         return Err(IpError::TooManyExceptions);
     }
-    ensure_family(profile, 4)?;
+    ensure_family(profile, 4, winner)?;
     if let Err(err) = ensure_exceptions(profile, 4) {
         let _ = remove_family(profile, 4);
         return Err(err);
     }
     if *allow_ipv6 {
-        if let Err(err) = ensure_family(profile, 6) {
+        if let Err(err) = ensure_family(profile, 6, winner) {
             let _ = remove_family(profile, 4);
             let _ = remove_family(profile, 6);
             return Err(err);
@@ -97,7 +104,11 @@ pub fn ensure(profile: &Profile) -> Result<(), IpError> {
     Ok(())
 }
 
-fn ensure_family(profile: &Profile, family: i32) -> Result<(), IpError> {
+fn ensure_family(
+    profile: &Profile,
+    family: i32,
+    winner: Option<&RouteLink>,
+) -> Result<(), IpError> {
     ensure_rule_for_family(family, profile.mark, profile.table, profile.rule_priority)?;
     let flag = if family == 6 { "-6" } else { "-4" };
     let table_arg = profile.table.to_string();
@@ -118,32 +129,85 @@ fn ensure_family(profile: &Profile, family: i32) -> Result<(), IpError> {
     )
     .map_err(|err| IpError::Command(err.to_string()))?;
 
-    let Some(Policy::Route {
-        interface,
-        gateway,
-        gateway6,
-        ..
-    }) = route(profile)
-    else {
+    match winner {
+        Some(link) => install_default(profile, family, link),
+        None => delete_default(family, profile.table),
+    }
+}
+
+/// Switch the profile's tunnel default to one link. `None` removes it and
+/// leaves the blackhole in place.
+///
+/// # Errors
+///
+/// Returns [`IpError`] when the `ip route` command fails.
+pub fn set_default(profile: &Profile, winner: Option<&RouteLink>) -> Result<(), IpError> {
+    let Some(Policy::Route { allow_ipv6, .. }) = route(profile) else {
         return Ok(());
     };
-    let gateway = if family == 6 { gateway6 } else { gateway };
+    match winner {
+        Some(link) => {
+            install_default(profile, 4, link)?;
+            if *allow_ipv6 {
+                install_default(profile, 6, link)?;
+            }
+        }
+        None => {
+            delete_default(4, profile.table)?;
+            if *allow_ipv6 {
+                delete_default(6, profile.table)?;
+            }
+        }
+    }
+    Ok(())
+}
 
+fn install_default(profile: &Profile, family: i32, link: &RouteLink) -> Result<(), IpError> {
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let gateway = if family == 6 {
+        link.gateway6.as_deref()
+    } else {
+        link.gateway.as_deref()
+    };
+    let table = profile.table.to_string();
     let mut args = vec![flag, "route", "replace", "default"];
     if let Some(gateway) = gateway {
         args.push("via");
-        args.push(gateway.as_str());
+        args.push(gateway);
     }
     args.extend([
         "dev",
-        interface.as_str(),
+        link.interface.as_str(),
         "table",
-        table_arg.as_str(),
+        table.as_str(),
         "metric",
         "100",
     ]);
     run("ip", &args, None).map_err(|err| IpError::Command(err.to_string()))?;
     Ok(())
+}
+
+fn delete_default(family: i32, table: u32) -> Result<(), IpError> {
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let table = table.to_string();
+    match run(
+        "ip",
+        &[
+            flag, "route", "del", "default", "table", &table, "metric", "100",
+        ],
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        // An absent route is the expected state while every link is down.
+        Err(err) => {
+            let text = err.to_string();
+            if text.contains("No such process") || text.contains("FIB table does not exist") {
+                Ok(())
+            } else {
+                Err(IpError::Command(text))
+            }
+        }
+    }
 }
 
 // Exceptions must be evaluated before the profile's mark rule, or the mark
@@ -302,15 +366,14 @@ fn remove_family(profile: &Profile, family: i32) -> Result<(), IpError> {
     Ok(())
 }
 
-pub fn exists(profile: &Profile) -> Result<bool, IpError> {
-    let Some(Policy::Route {
-        allow_ipv6,
-        interface,
-        gateway,
-        gateway6,
-        ..
-    }) = route(profile)
-    else {
+/// Check the profile against the link that should carry the tunnel default.
+/// `None` means every link is down, so the blackhole must stand alone.
+///
+/// # Errors
+///
+/// Returns [`IpError`] when the installed rules and routes cannot be read.
+pub fn exists_for(profile: &Profile, winner: Option<&RouteLink>) -> Result<bool, IpError> {
+    let Some(Policy::Route { allow_ipv6, .. }) = route(profile) else {
         return Ok(true);
     };
     let rule_ok = rules(4)?.iter().any(|rule| {
@@ -318,26 +381,63 @@ pub fn exists(profile: &Profile) -> Result<bool, IpError> {
             && rule.table == profile.table
             && rule.priority == profile.rule_priority
     });
-    if !rule_ok {
+    if !rule_ok || !blackhole_default(4, profile.table)? || !exceptions_ok(profile, 4)? {
         return Ok(false);
     }
-    let route_ok = blackhole_default(4, profile.table)?
-        && tunnel_default(4, profile.table, interface, gateway.as_deref())?;
-    if !exceptions_ok(profile, 4)? {
+    let route_ok = match winner {
+        Some(link) => tunnel_default(4, profile.table, &link.interface, link.gateway.as_deref())?,
+        None => tunnel_default_absent(4, profile.table)?,
+    };
+    if !route_ok {
         return Ok(false);
     }
     if *allow_ipv6 {
-        return Ok(route_ok
-            && rules(6)?.iter().any(|rule| {
-                rule.mark == profile.mark
-                    && rule.table == profile.table
-                    && rule.priority == profile.rule_priority
-            })
+        let rule6 = rules(6)?.iter().any(|rule| {
+            rule.mark == profile.mark
+                && rule.table == profile.table
+                && rule.priority == profile.rule_priority
+        });
+        let route6 = match winner {
+            Some(link) => {
+                tunnel_default(6, profile.table, &link.interface, link.gateway6.as_deref())?
+            }
+            None => tunnel_default_absent(6, profile.table)?,
+        };
+        return Ok(rule6
             && blackhole_default(6, profile.table)?
-            && tunnel_default(6, profile.table, interface, gateway6.as_deref())?
+            && route6
             && exceptions_ok(profile, 6)?);
     }
-    Ok(route_ok)
+    Ok(true)
+}
+
+/// Doctor's view: the rules and blackhole exist. A failover profile may have
+/// no tunnel default while every link is down, so that is not a failure.
+///
+/// # Errors
+///
+/// Returns [`IpError`] when the installed rules and routes cannot be read.
+pub fn installed(profile: &Profile) -> Result<bool, IpError> {
+    let Some(Policy::Route { allow_ipv6, .. }) = route(profile) else {
+        return Ok(true);
+    };
+    let rule_ok = rules(4)?.iter().any(|rule| {
+        rule.mark == profile.mark
+            && rule.table == profile.table
+            && rule.priority == profile.rule_priority
+    });
+    if !rule_ok || !blackhole_default(4, profile.table)? || !exceptions_ok(profile, 4)? {
+        return Ok(false);
+    }
+    if *allow_ipv6 {
+        let rule6 = rules(6)?.iter().any(|rule| {
+            rule.mark == profile.mark
+                && rule.table == profile.table
+                && rule.priority == profile.rule_priority
+        });
+        return Ok(rule6 && blackhole_default(6, profile.table)? && exceptions_ok(profile, 6)?);
+    }
+    Ok(true)
 }
 
 /// Canonicalizes a CIDR to its network address so stored policies compare
@@ -409,6 +509,18 @@ fn tunnel_default(
         entries
             .iter()
             .any(|entry| is_tunnel_default(entry, interface, gateway))
+    }))
+}
+
+fn tunnel_default_absent(family: i32, table: u32) -> Result<bool, IpError> {
+    let flag = if family == 6 { "-6" } else { "-4" };
+    let value = show_routes(flag, table)?;
+    Ok(value.as_array().is_none_or(|entries| {
+        !entries.iter().any(|entry| {
+            entry.get("dst").and_then(Value::as_str) == Some("default")
+                && entry.get("type").and_then(Value::as_str) != Some("blackhole")
+                && entry.get("metric").and_then(Value::as_u64) == Some(100)
+        })
     }))
 }
 

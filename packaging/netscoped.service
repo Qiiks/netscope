@@ -13,7 +13,9 @@ TimeoutStopSec=30
 User=root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=RUST_LOG=info
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+# CAP_CHOWN lets socket_owner() hand the control socket to group netscope;
+# without it the socket stays root:root 0660 and every member is denied.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_CHOWN
 AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict

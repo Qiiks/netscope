@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use netscope_linux::cgroup::{self, AttachSource, CgroupError, CgroupManager};
 use netscope_linux::fanotify::{Fanotify, FanotifyError};
 use netscope_linux::ip;
+use netscope_linux::links::{self, LinkMonitor, ProbeConfig, ProbeOutcome};
 use netscope_linux::nft::NftManager;
 use netscope_linux::proc;
 use netscope_linux::protocol::{
@@ -22,8 +23,9 @@ use netscope_linux::run;
 use netscope_linux::sockets::{self, SocketMarkError};
 use netscope_linux::types::{
     consumer_id_valid, mark, profile_id_valid, rule_priority, suggest_profile_id, table,
-    table_name, Claim, Config, FilterDefault, Hold, Policy, PolicySpec, Preopen, Profile,
-    ProfileId, State, Target, TargetKind, TargetSpec, MARK_BASE, MAX_PROFILES,
+    table_name, Claim, Config, FilterDefault, Hold, LinkPhase, LinkStatus, Policy, PolicySpec,
+    Preopen, Profile, ProfileId, RouteLink, State, Target, TargetKind, TargetSpec, MARK_BASE,
+    MAX_PROFILES,
 };
 use netscope_linux::watcher::{self, ExecEvent};
 use serde::Deserialize;
@@ -69,6 +71,7 @@ struct Inner {
     provenance: HashMap<u32, AttachSource>,
     marked: HashMap<ProfileId, HashSet<u32>>,
     health: HashMap<String, bool>,
+    links: HashMap<ProfileId, LinkMonitor>,
 }
 
 #[tokio::main]
@@ -133,6 +136,7 @@ async fn async_main() -> Result<(), String> {
             provenance: HashMap::new(),
             marked: HashMap::new(),
             health: HashMap::new(),
+            links: HashMap::new(),
         }),
         shutting_down: AtomicBool::new(false),
         next_connection: AtomicU64::new(1),
@@ -174,6 +178,7 @@ async fn async_main() -> Result<(), String> {
     let poll_handle = tokio::spawn(poll_task(rt.clone(), poll_interval));
     let refresh_handle = tokio::spawn(refresh_task(rt.clone(), refresh_interval));
     let health_handle = tokio::spawn(health_task(rt.clone()));
+    let link_handle = tokio::spawn(link_task(rt.clone()));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|err| format!("signal: {err}"))?;
@@ -214,6 +219,7 @@ async fn async_main() -> Result<(), String> {
     poll_handle.abort();
     refresh_handle.abort();
     health_handle.abort();
+    link_handle.abort();
     if let Some(handle) = exec_handle {
         handle.abort();
     }
@@ -325,6 +331,9 @@ fn load_config(path: &Path) -> Result<Config, String> {
                 "refresh_interval_secs",
                 "max_profiles",
                 "log_level",
+                "probe_interval_ms",
+                "probe_target",
+                "probe_target6",
             ]
             .contains(&key.as_str())
             {
@@ -355,6 +364,15 @@ fn load_config(path: &Path) -> Result<Config, String> {
         if let Some(value) = daemon.get("log_level") {
             cfg.daemon.log_level = config_string(value, "daemon.log_level")?;
         }
+        if let Some(value) = daemon.get("probe_interval_ms") {
+            cfg.daemon.probe_interval_ms = config_integer(value, "daemon.probe_interval_ms")?;
+        }
+        if let Some(value) = daemon.get("probe_target") {
+            cfg.daemon.probe_target = config_string(value, "daemon.probe_target")?;
+        }
+        if let Some(value) = daemon.get("probe_target6") {
+            cfg.daemon.probe_target6 = config_string(value, "daemon.probe_target6")?;
+        }
     }
     if cfg.daemon.max_profiles == 0 || cfg.daemon.max_profiles > 32 {
         return Err("config: daemon.max_profiles must be 1..=32".to_string());
@@ -365,6 +383,17 @@ fn load_config(path: &Path) -> Result<Config, String> {
     if !(1..=300).contains(&cfg.daemon.refresh_interval_secs) {
         return Err("config: daemon.refresh_interval_secs must be 1..=300".to_string());
     }
+    if !(500..=60_000).contains(&cfg.daemon.probe_interval_ms) {
+        return Err("config: daemon.probe_interval_ms must be 500..=60000".to_string());
+    }
+    cfg.daemon
+        .probe_target
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "config: daemon.probe_target must be an address:port".to_string())?;
+    cfg.daemon
+        .probe_target6
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "config: daemon.probe_target6 must be an address:port".to_string())?;
     Ok(cfg)
 }
 
@@ -663,7 +692,7 @@ fn reconcile(rt: &Rt, inner: &mut Inner) -> Result<(), String> {
             // cgroup; a reused mark index must not capture it. Live processes
             // are re-marked by attach_matches below.
             clear_all_marks(&id, profile.mark);
-            reconcile_enabled(rt, &profile)
+            reconcile_enabled(rt, inner, &profile)
         } else {
             reconcile_disabled(rt, inner, &profile)
         };
@@ -690,7 +719,7 @@ fn reconcile(rt: &Rt, inner: &mut Inner) -> Result<(), String> {
     Ok(())
 }
 
-fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
+fn reconcile_enabled(rt: &Rt, inner: &Inner, profile: &Profile) -> Result<bool, String> {
     if !rt.cgroup.root().join(&profile.id).is_dir() {
         rt.cgroup
             .ensure_profile(&profile.id)
@@ -699,7 +728,8 @@ fn reconcile_enabled(rt: &Rt, profile: &Profile) -> Result<bool, String> {
     }
     rt.nft.apply(profile).map_err(|err| err.to_string())?;
     if profile.has_route() {
-        ip::ensure(profile).map_err(|err| err.to_string())?;
+        let winner = expected_link(inner, profile);
+        ip::ensure_for(profile, winner.as_ref()).map_err(|err| err.to_string())?;
     }
     let mut healthy = true;
     if fanotify_active(rt) {
@@ -1220,6 +1250,21 @@ fn restat_preopens(rt: &Rt, inner: &mut Inner, ids: &[ProfileId]) -> usize {
     changed
 }
 
+/// Link the health repair should keep. Before the first probe the primary
+/// link is the expectation, matching what `ip::ensure` installed.
+fn expected_link(inner: &Inner, profile: &Profile) -> Option<RouteLink> {
+    link_expectation(inner.links.get(&profile.id), &profile.route_links())
+}
+
+/// Health repair keeps the monitor's winner. Falling back to the first
+/// configured link here would undo a failover on the next tick.
+fn link_expectation(monitor: Option<&LinkMonitor>, links: &[RouteLink]) -> Option<RouteLink> {
+    match monitor {
+        Some(monitor) => monitor.winner().cloned(),
+        None => links.first().cloned(),
+    }
+}
+
 fn health_tick(rt: &Rt, inner: &mut Inner) {
     let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
     for id in ids {
@@ -1263,9 +1308,12 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
             }
         }
         if profile.has_route() {
-            match ip::exists(&profile) {
+            // The monitor may have moved the default to another link; repair
+            // against its winner instead of resetting to the first link.
+            let winner = expected_link(inner, &profile);
+            match ip::exists_for(&profile, winner.as_ref()) {
                 Ok(true) => {}
-                Ok(false) => match ip::ensure(&profile) {
+                Ok(false) => match ip::ensure_for(&profile, winner.as_ref()) {
                     Ok(()) => info!("health repaired profile={id} component=ip"),
                     Err(err) => {
                         warn!("health profile={id} ip error={err}");
@@ -1285,9 +1333,11 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
             }
         }
         if healthy {
+            let winner = expected_link(inner, &profile);
             healthy = rt.cgroup.root().join(&id).is_dir()
                 && (!profile.has_policies() || rt.nft.exists(&profile).unwrap_or(false))
-                && (!profile.has_route() || ip::exists(&profile).unwrap_or(false));
+                && (!profile.has_route()
+                    || ip::exists_for(&profile, winner.as_ref()).unwrap_or(false));
         }
         inner.health.insert(id, healthy);
     }
@@ -1366,6 +1416,130 @@ async fn health_task(rt: Arc<Rt>) {
         }
         let mut inner = rt.inner.lock().await;
         health_tick(&rt, &mut inner);
+    }
+}
+
+async fn link_task(rt: Arc<Rt>) {
+    let config = ProbeConfig {
+        interval_ms: rt.cfg.daemon.probe_interval_ms,
+        target: rt
+            .cfg
+            .daemon
+            .probe_target
+            .parse()
+            .expect("probe_target is validated when the config loads"),
+        target6: rt.cfg.daemon.probe_target6.parse().ok(),
+    };
+    let mut ticker = interval(Duration::from_millis(config.interval_ms));
+    loop {
+        ticker.tick().await;
+        if rt.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let jobs = {
+            let mut inner = rt.inner.lock().await;
+            let ids: HashSet<ProfileId> = inner.state.profiles.keys().cloned().collect();
+            inner.links.retain(|id, _| ids.contains(id));
+            inner
+                .state
+                .profiles
+                .values()
+                .filter(|profile| profile.enabled && profile.has_route())
+                .map(|profile| {
+                    (
+                        profile.id.clone(),
+                        profile.route_links(),
+                        matches!(
+                            profile.route_policy(),
+                            Some((
+                                _,
+                                Policy::Route {
+                                    allow_ipv6: true,
+                                    ..
+                                }
+                            ))
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if jobs.is_empty() {
+            continue;
+        }
+        let probe_config = config.clone();
+        let Some(results) = tokio::task::spawn_blocking(move || {
+            // One thread per link keeps a slow or timing-out link from
+            // stretching the round past the probe interval.
+            std::thread::scope(|scope| {
+                jobs.into_iter()
+                    .map(|(id, links, allow_ipv6)| {
+                        let handles = links
+                            .iter()
+                            .map(|link| {
+                                let mut config = probe_config.clone();
+                                if !allow_ipv6 {
+                                    config.target6 = None;
+                                }
+                                let link = link.clone();
+                                scope.spawn(move || links::probe(&link, &config))
+                            })
+                            .collect::<Vec<_>>();
+                        let outcomes = handles
+                            .into_iter()
+                            .map(|handle| handle.join().unwrap_or_else(|_| ProbeOutcome::failed()))
+                            .collect::<Vec<_>>();
+                        (id, outcomes)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .ok() else {
+            warn!("link probe task failed");
+            continue;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let mut inner = rt.inner.lock().await;
+        for (id, outcomes) in results {
+            let Some(profile) = inner.state.profiles.get(&id).cloned() else {
+                continue;
+            };
+            let links_now = profile.route_links();
+            let unchanged = inner.links.get(&id).is_some_and(|monitor| {
+                monitor.entries.len() == links_now.len()
+                    && monitor
+                        .entries
+                        .iter()
+                        .zip(&links_now)
+                        .all(|(entry, link)| &entry.link == link)
+            });
+            // A rebuilt monitor starts optimistic on the new primary, so its
+            // winner must be applied even when the index did not move.
+            let rebuilt = !unchanged;
+            if rebuilt {
+                inner
+                    .links
+                    .insert(id.clone(), LinkMonitor::new(links_now.clone()));
+            }
+            let Some(monitor) = inner.links.get_mut(&id) else {
+                continue;
+            };
+            let before = monitor.active;
+            let winner = monitor.step(&outcomes, now);
+            if !rebuilt && before == winner {
+                continue;
+            }
+            let link = winner.and_then(|index| links_now.get(index));
+            match ip::set_default(&profile, link) {
+                Ok(()) => info!(
+                    "link switch profile={id} active={}",
+                    link.map_or("none", |link| link.interface.as_str())
+                ),
+                Err(err) => warn!("link switch profile={id} error={err}"),
+            }
+        }
     }
 }
 
@@ -2018,7 +2192,7 @@ async fn open_scope(
         profile.enabled = true;
         profile.touch();
         let profile = profile.clone();
-        if let Err(err) = apply_profile(rt, &profile) {
+        if let Err(err) = apply_profile(rt, &inner, &profile) {
             inner.state.profiles.insert(id.clone(), before.clone());
             remove_loader_marks(rt, &inner, &profile);
             restore_profile(rt, &inner, &before);
@@ -2084,7 +2258,7 @@ async fn open_scope(
         created_at: now.clone(),
         updated_at: now,
     };
-    if let Err(err) = apply_profile(rt, &profile) {
+    if let Err(err) = apply_profile(rt, &inner, &profile) {
         rollback_profile(rt, &inner, &profile);
         return Err(err);
     }
@@ -2166,7 +2340,7 @@ async fn set_policy(
     }
     let old = profile.policies.insert(consumer.to_string(), policy);
     profile.touch();
-    if let Err(err) = apply_profile(rt, &profile) {
+    if let Err(err) = apply_profile(rt, &inner, &profile) {
         match old {
             Some(old) => {
                 profile.policies.insert(consumer.to_string(), old);
@@ -2211,7 +2385,7 @@ async fn clear_policy(
     let before = profile.clone();
     profile.policies.remove(consumer);
     profile.touch();
-    if let Err(err) = apply_profile(rt, &profile) {
+    if let Err(err) = apply_profile(rt, &inner, &profile) {
         restore_profile(rt, &inner, &before);
         return Err(err);
     }
@@ -2258,7 +2432,7 @@ async fn close_scope(
             consumers: Vec::new(),
         });
     }
-    if let Err(err) = apply_profile(rt, &profile) {
+    if let Err(err) = apply_profile(rt, &inner, &profile) {
         restore_profile(rt, &inner, &before);
         return Err(err);
     }
@@ -2304,7 +2478,7 @@ async fn release_connection(rt: &Rt, connection: u64) {
         if profile.claims.is_empty() {
             teardown_profile(rt, &mut inner, &profile);
         } else {
-            if let Err(err) = apply_profile(rt, &profile) {
+            if let Err(err) = apply_profile(rt, &inner, &profile) {
                 warn!("release connection={connection} profile={id} error={err}");
                 continue;
             }
@@ -2533,7 +2707,31 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         consumers: profile.claims.keys().cloned().collect(),
         policies,
         generation: profile.generation,
+        links: link_statuses(inner, profile),
     }
+}
+
+/// Before the first probe, report the configured links optimistically with
+/// the primary active; the monitor then replaces this view.
+fn link_statuses(inner: &Inner, profile: &Profile) -> Vec<LinkStatus> {
+    if let Some(monitor) = inner.links.get(&profile.id) {
+        return monitor.statuses();
+    }
+    profile
+        .route_links()
+        .into_iter()
+        .enumerate()
+        .map(|(index, link)| LinkStatus {
+            interface: link.interface,
+            gateway: link.gateway,
+            gateway6: link.gateway6,
+            phase: LinkPhase::Up,
+            healthy: true,
+            active: index == 0,
+            rtt_ms: None,
+            last_ok_unix: None,
+        })
+        .collect()
 }
 
 fn kernel_release() -> String {
@@ -2614,7 +2812,7 @@ async fn add_profile(
         updated_at: now,
     };
 
-    if let Err(err) = apply_profile(rt, &profile) {
+    if let Err(err) = apply_profile(rt, &inner, &profile) {
         rollback_profile(rt, &inner, &profile);
         return Err(err);
     }
@@ -2632,13 +2830,16 @@ async fn add_profile(
     Ok(profile_status(rt, &inner, &profile))
 }
 
-fn apply_profile(rt: &Rt, profile: &Profile) -> Result<(), String> {
+fn apply_profile(rt: &Rt, inner: &Inner, profile: &Profile) -> Result<(), String> {
     rt.cgroup
         .ensure_profile(&profile.id)
         .map_err(|err| err.to_string())?;
     rt.nft.apply(profile).map_err(|err| err.to_string())?;
     if profile.has_route() {
-        ip::ensure(profile).map_err(|err| err.to_string())?;
+        // A re-apply must keep the monitor's winner; `ensure` would reseat
+        // the default on the first configured link and bounce a live failover.
+        let winner = expected_link(inner, profile);
+        ip::ensure_for(profile, winner.as_ref()).map_err(|err| err.to_string())?;
     }
     if fanotify_active(rt) {
         add_target_mark(rt, profile).map_err(|err| err.to_string())?;
@@ -2661,7 +2862,7 @@ fn rollback_profile(rt: &Rt, inner: &Inner, profile: &Profile) {
 /// matches the state the caller is told is still in force.
 fn restore_profile(rt: &Rt, inner: &Inner, profile: &Profile) {
     if profile.enabled {
-        if let Err(err) = apply_profile(rt, profile) {
+        if let Err(err) = apply_profile(rt, inner, profile) {
             warn!("restore profile={} error={err}", profile.id);
         }
     } else {
@@ -2828,7 +3029,7 @@ async fn set_enabled(
                 stored.updated_at = profile.updated_at.clone();
             }
         }
-        if let Err(err) = apply_profile(rt, &profile) {
+        if let Err(err) = apply_profile(rt, &inner, &profile) {
             rollback_profile(rt, &inner, &profile);
             return Err(err);
         }
@@ -2954,6 +3155,7 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             interface,
             gateway,
             gateway6,
+            links,
             include_lan,
             allow_ipv6,
             udp_only,
@@ -2961,33 +3163,8 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             except_sports,
             except,
         } => {
-            if interface.is_empty()
-                || interface.contains('/')
-                || interface == "."
-                || interface == ".."
-            {
-                return Err(format!("invalid interface `{interface}`"));
-            }
-            let sysfs = Path::new("/sys/class/net").join(interface);
-            if !sysfs.is_dir() {
-                run("ip", &["link", "show", "dev", interface], None)
-                    .map_err(|_| format!("interface {interface} does not exist"))?;
-            }
-            if let Some(gateway) = gateway {
-                gateway
-                    .parse::<std::net::Ipv4Addr>()
-                    .map_err(|_| format!("invalid IPv4 gateway {gateway}"))?;
-            }
-            let mut normalized_gateway6 = None;
-            if let Some(gateway6) = gateway6 {
-                if !*allow_ipv6 {
-                    return Err("gateway6 requires allow_ipv6".to_string());
-                }
-                let parsed = gateway6
-                    .parse::<std::net::Ipv6Addr>()
-                    .map_err(|_| format!("invalid IPv6 gateway {gateway6}"))?;
-                normalized_gateway6 = Some(parsed.to_string());
-            }
+            let links = normalize_links(interface, gateway, gateway6, links, *allow_ipv6)?;
+            let primary = &links[0];
             if except.len() > 30 {
                 return Err("route policy accepts at most 30 exception networks".to_string());
             }
@@ -3024,9 +3201,10 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
                 normalized.push(canonical);
             }
             Ok(Policy::Route {
-                interface: interface.clone(),
-                gateway: gateway.clone(),
-                gateway6: normalized_gateway6,
+                interface: primary.interface.clone(),
+                gateway: primary.gateway.clone(),
+                gateway6: primary.gateway6.clone(),
+                links,
                 include_lan: *include_lan,
                 allow_ipv6: *allow_ipv6,
                 udp_only: *udp_only,
@@ -3036,6 +3214,63 @@ fn validate_mode(spec: &PolicySpec) -> Result<Policy, String> {
             })
         }
     }
+}
+
+/// The daemon is the authority on link syntax; the CLI performs the same
+/// checks so a user sees the error without a round trip.
+fn normalize_links(
+    interface: &str,
+    gateway: &Option<String>,
+    gateway6: &Option<String>,
+    links: &[RouteLink],
+    allow_ipv6: bool,
+) -> Result<Vec<RouteLink>, String> {
+    let mut links = if links.is_empty() {
+        vec![RouteLink {
+            interface: interface.to_string(),
+            gateway: gateway.clone(),
+            gateway6: gateway6.clone(),
+        }]
+    } else {
+        if gateway.is_some() || gateway6.is_some() {
+            return Err("gateway belongs to a link; use --link iface@gateway".to_string());
+        }
+        links.to_vec()
+    };
+    if links.len() > 8 {
+        return Err("route policy accepts at most 8 links".to_string());
+    }
+    let mut seen = HashSet::new();
+    for link in &mut links {
+        let interface = &link.interface;
+        if interface.is_empty() || interface.contains('/') || interface == "." || interface == ".."
+        {
+            return Err(format!("invalid interface `{interface}`"));
+        }
+        let sysfs = Path::new("/sys/class/net").join(interface);
+        if !sysfs.is_dir() {
+            run("ip", &["link", "show", "dev", interface], None)
+                .map_err(|_| format!("interface {interface} does not exist"))?;
+        }
+        if !seen.insert(interface.clone()) {
+            return Err(format!("duplicate link interface {interface}"));
+        }
+        if let Some(gateway) = &link.gateway {
+            gateway
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| format!("invalid IPv4 gateway {gateway}"))?;
+        }
+        if let Some(gateway6) = &link.gateway6 {
+            if !allow_ipv6 {
+                return Err("gateway6 requires allow_ipv6".to_string());
+            }
+            let parsed = gateway6
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| format!("invalid IPv6 gateway {gateway6}"))?;
+            link.gateway6 = Some(parsed.to_string());
+        }
+    }
+    Ok(links)
 }
 
 fn parse_cidr(text: &str) -> Result<String, String> {
@@ -3210,6 +3445,44 @@ mod tests {
     }
 
     #[test]
+    fn health_expectation_follows_the_monitor_winner() {
+        let links = vec![
+            RouteLink {
+                interface: "eth0".to_string(),
+                gateway: None,
+                gateway6: None,
+            },
+            RouteLink {
+                interface: "eth1".to_string(),
+                gateway: None,
+                gateway6: None,
+            },
+        ];
+        let mut monitor = LinkMonitor::new(links.clone());
+        let failed = ProbeOutcome::failed();
+        let healthy = ProbeOutcome::Up { rtt_ms: Some(10) };
+        for now in 0..3 {
+            monitor.step(&[failed, healthy], now);
+        }
+        assert_eq!(monitor.active, Some(1), "secondary should carry traffic");
+        // Repeated health ticks keep the secondary; they must not reset to eth0.
+        for _ in 0..3 {
+            let expected = link_expectation(Some(&monitor), &links).expect("a winner");
+            assert_eq!(expected.interface, "eth1");
+        }
+        // Before the first probe there is no monitor; the primary is expected.
+        assert_eq!(
+            link_expectation(None, &links).map(|link| link.interface),
+            Some("eth0".to_string())
+        );
+        // Every link down must expect no tunnel default, leaving the blackhole.
+        for now in 0..3 {
+            monitor.step(&[failed, failed], now);
+        }
+        assert_eq!(link_expectation(Some(&monitor), &links), None);
+    }
+
+    #[test]
     fn rfc3339_is_utc_and_fixed_width() {
         let stamp = now_rfc3339();
         assert_eq!(stamp.len(), 20);
@@ -3230,6 +3503,9 @@ mod tests {
         assert_eq!(cfg.daemon.socket_path, PathBuf::from("/tmp/netscope.sock"));
         assert_eq!(cfg.daemon.poll_interval_ms, 1000);
         assert_eq!(cfg.daemon.max_profiles, 32);
+        assert_eq!(cfg.daemon.probe_interval_ms, 2000);
+        assert_eq!(cfg.daemon.probe_target, "1.1.1.1:443");
+        assert_eq!(cfg.daemon.probe_target6, "[2606:4700:4700::1111]:443");
     }
 
     #[test]

@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-client"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "netscope-linux",
  "serde",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -338,13 +338,14 @@ dependencies = [
 
 [[package]]
 name = "netscope-linux"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ipnet",
  "libc",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

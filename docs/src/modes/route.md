@@ -12,7 +12,8 @@ The interface must already exist and be up. If it does not, the daemon fails to 
 
 | Option | Meaning |
 |---|---|
-| `--route <iface>` | Interface for the default route, for example `tun0` or `wg0`. Required. |
+| `--route <iface>` | Interface for the default route, for example `tun0` or `wg0`. Required unless `--link` is given. |
+| `--link <spec>` | Ordered failover link, repeatable: `<iface>[@<ipv4>][#<ipv6>]`. Conflicts with `--route` and the standalone gateway flags. |
 | `--gateway <ipv4>` | IPv4 next hop. Optional when the interface is point-to-point. |
 | `--gateway6 <ipv6>` | IPv6 next hop. Only valid with `--allow-ipv6`. |
 | `--include-lan` | Route LAN destinations through the tunnel instead of bypassing them. |
@@ -47,6 +48,9 @@ The table contains two defaults:
 |---|---|---|
 | `default dev <iface> [via <gateway>]` | 100 | Used while the interface has a usable route. |
 | `blackhole default` | 1000 | Used when the real route is gone, so traffic fails instead of falling back to the main table. |
+
+With ordered links the tunnel default is moved between links, or removed
+entirely while every link is down; the blackhole stays installed either way.
 
 The mark and table values come from the profile index. Table `20000` and mark `0x4e53` are the first profile; the next profile uses `20001` and `0x4e54`, up to 32 profiles.
 
@@ -105,6 +109,54 @@ sudo netscope --uid "$(id -u)" add routed6 \
 ```
 
 With `--allow-ipv6`, the daemon also installs an IPv6 policy rule and an IPv6 default route in the same table. If the IPv6 route cannot be installed, the add fails and the profile is not left applied. If the interface later loses that route, the IPv6 blackhole matches and the traffic fails instead of using the main table. `--gateway6` is optional for point-to-point interfaces.
+
+## Ordered links and failover
+
+`--link` replaces `--route` with an ordered list of interfaces. The profile
+gets one default route at a time, owned by the first link that is healthy, and
+the same winner is used for IPv4 and, when `--allow-ipv6` is set, IPv6.
+
+```sh
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch \
+  --process Overwatch.exe \
+  --link enp7s0f4u1 --link wwan0@10.64.0.1
+```
+
+Each link is probed every `probe_interval_ms` (`2000` by default). A probe
+binds to that interface, clears any inherited firewall mark, and opens a TCP
+connection to `probe_target` with a one-second timeout; an interface with no
+global source address is probed with ICMP through `ping -I` instead. Probe
+failure is a health signal, not a daemon error.
+
+| State | Rule |
+|---|---|
+| Failure | Three consecutive failed probes take a link from `up` to `down`. |
+| Recovery | Two consecutive successful probes take it from `down` back to `up`. |
+| Winner | The first link in `--link` order whose phase is `up`. |
+| Failback | A recovered higher-priority link takes over only after its second success, so a flapping link does not bounce the route. |
+| All down | No tunnel default is installed; the profile's blackhole rejects its traffic. |
+
+The daemon applies the winner's default route immediately on a change. Its
+health reconciler (`exists_for`/`ensure_for`) follows the current winner as
+well, so a switched default is not reset to the first configured link on the
+next tick, and a profile whose links are all down keeps its rules and blackhole.
+
+Status shows the probe state for every link:
+
+```text
+NAME       MODE    ENABLED  TARGET             ATTACHED  CONSUMERS  POLICIES      PIDS
+overwatch  route   yes      name:Overwatch.exe late      exitlink   exitlink:route 6120
+  link enp7s0f4u1  10.0.0.1   up    41ms   -
+  link wwan0       10.64.0.1  up    88ms   active
+```
+
+`status --json` carries the same data in the profile's `links` array. The
+winner is the entry with `active: true`; `healthy` mirrors the phase.
+
+This is not a kill switch for the whole machine. It protects traffic that
+enters the profile — the selected executable, process tree, or Wine launch. A
+game started outside the scoped path has no mark, no route, and no blackhole,
+so it is unaffected by failover.
 
 ## Fail-closed while active, fail-open on removal
 

@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-netscope-client = "0.2.1"
+netscope-client = "0.3.0"
 ```
 
 ```rust

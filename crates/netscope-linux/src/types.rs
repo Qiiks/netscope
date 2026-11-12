@@ -65,6 +65,60 @@ pub enum FilterDefault {
     Allow,
 }
 
+/// One interface a route profile may use, in preference order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteLink {
+    /// Interface name, for example `tun0` or `enp7s0f4u1`.
+    pub interface: String,
+    /// Optional IPv4 next hop.
+    #[serde(default)]
+    pub gateway: Option<String>,
+    /// Optional IPv6 next hop; only used with `allow_ipv6`.
+    #[serde(default)]
+    pub gateway6: Option<String>,
+}
+
+/// Probe state of one route link.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LinkPhase {
+    /// Healthy; eligible to carry the default route.
+    Up,
+    /// Failed probes took it out of the candidate set.
+    Down,
+}
+
+impl std::fmt::Display for LinkPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        })
+    }
+}
+
+/// One route link as reported by `status`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkStatus {
+    /// Interface name.
+    pub interface: String,
+    /// IPv4 next hop, when one is configured.
+    pub gateway: Option<String>,
+    /// IPv6 next hop, when one is configured.
+    pub gateway6: Option<String>,
+    /// Current probe state.
+    pub phase: LinkPhase,
+    /// Same signal as `phase == up`, kept for the status shape in the issue.
+    pub healthy: bool,
+    /// Whether this link currently carries the profile's default route.
+    pub active: bool,
+    /// Smoothed round-trip time in milliseconds, once a probe succeeded.
+    pub rtt_ms: Option<u32>,
+    /// Unix time of the last successful probe.
+    pub last_ok_unix: Option<u64>,
+}
+
 /// One consumer's networking intent for a shared profile.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -78,6 +132,10 @@ pub enum Policy {
         interface: String,
         gateway: Option<String>,
         gateway6: Option<String>,
+        /// Ordered failover candidates. Empty in state written before 0.3.0;
+        /// the primary mirror above then describes the only link.
+        #[serde(default)]
+        links: Vec<RouteLink>,
         include_lan: bool,
         allow_ipv6: bool,
         /// Mark only IPv4 UDP. TCP stays on the host's normal path, which lets
@@ -98,6 +156,28 @@ pub enum Policy {
     },
 }
 
+impl Policy {
+    /// Links in preference order; empty for a filter policy. A route policy
+    /// stored before 0.3.0 has no `links` list, so its primary mirror is the
+    /// only candidate.
+    pub fn route_links(&self) -> Vec<RouteLink> {
+        match self {
+            Self::Route { links, .. } if !links.is_empty() => links.clone(),
+            Self::Route {
+                interface,
+                gateway,
+                gateway6,
+                ..
+            } => vec![RouteLink {
+                interface: interface.clone(),
+                gateway: gateway.clone(),
+                gateway6: gateway6.clone(),
+            }],
+            Self::Filter { .. } => Vec::new(),
+        }
+    }
+}
+
 /// The validated form a consumer sends. `allow_cidrs`/`deny_cidrs` keep the
 /// existing CLI vocabulary; the daemon normalizes them into [`Policy`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +194,10 @@ pub enum PolicySpec {
         interface: String,
         gateway: Option<String>,
         gateway6: Option<String>,
+        /// Ordered failover candidates. An older client sends only the
+        /// primary mirror; the daemon then uses that one link.
+        #[serde(default)]
+        links: Vec<RouteLink>,
         #[serde(default)]
         include_lan: bool,
         #[serde(default)]
@@ -231,6 +315,13 @@ impl Profile {
         self.route_policy().is_some()
     }
 
+    /// Route links in preference order. State written before 0.3.0 has no
+    /// `links` list, so the primary mirror is the only candidate.
+    pub fn route_links(&self) -> Vec<RouteLink> {
+        self.route_policy()
+            .map_or_else(Vec::new, |(_, policy)| policy.route_links())
+    }
+
     /// True when the profile routes and that route is scoped to UDP. Socket
     /// marking must follow it: a mark on a TCP socket would route a
     /// handshake into a UDP-only interface.
@@ -293,6 +384,9 @@ pub struct DaemonConfig {
     pub refresh_interval_secs: u64,
     pub max_profiles: u8,
     pub log_level: String,
+    pub probe_interval_ms: u64,
+    pub probe_target: String,
+    pub probe_target6: String,
 }
 
 impl Default for DaemonConfig {
@@ -305,6 +399,9 @@ impl Default for DaemonConfig {
             refresh_interval_secs: 5,
             max_profiles: MAX_PROFILES,
             log_level: "info".to_string(),
+            probe_interval_ms: 2000,
+            probe_target: "1.1.1.1:443".to_string(),
+            probe_target6: "[2606:4700:4700::1111]:443".to_string(),
         }
     }
 }
@@ -525,5 +622,42 @@ mod tests {
     #[test]
     fn table_names_are_one_per_profile() {
         assert_eq!(table_name("my-game"), "netscope_my_game");
+    }
+
+    #[test]
+    fn route_policy_without_links_uses_the_primary_mirror() {
+        let policy: Policy = serde_json::from_str(
+            r#"{"kind":"route","interface":"tun0","gateway":"10.0.0.1","gateway6":null,
+                "include_lan":false,"allow_ipv6":false,"udp_only":false,
+                "except_ports":[],"except_sports":[],"except":[]}"#,
+        )
+        .expect("pre-0.3.0 route policy parses");
+        assert_eq!(
+            policy.route_links(),
+            vec![RouteLink {
+                interface: "tun0".to_string(),
+                gateway: Some("10.0.0.1".to_string()),
+                gateway6: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn link_status_carries_healthy_phase_and_rtt() {
+        let status = LinkStatus {
+            interface: "enp7s0f4u1".to_string(),
+            gateway: Some("10.0.0.1".to_string()),
+            gateway6: None,
+            phase: LinkPhase::Up,
+            healthy: true,
+            active: true,
+            rtt_ms: Some(41),
+            last_ok_unix: Some(1_700_000_000),
+        };
+        let value = serde_json::to_value(&status).expect("serialize link status");
+        assert_eq!(value["healthy"], true);
+        assert_eq!(value["phase"], "up");
+        assert_eq!(value["rtt_ms"], 41);
+        assert_eq!(value["active"], true);
     }
 }

@@ -6,3 +6,6 @@ poll_interval_ms = 1000
 refresh_interval_secs = 5
 max_profiles = 32
 log_level = "info"
+probe_interval_ms = 2000
+probe_target = "1.1.1.1:443"
+probe_target6 = "[2606:4700:4700::1111]:443"

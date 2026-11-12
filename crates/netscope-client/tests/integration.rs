@@ -167,6 +167,7 @@ fn profile_fixture() -> ProfileStatus {
         consumers: vec!["exitlink".to_string()],
         policies: vec!["filter".to_string()],
         generation: 7,
+        links: Vec::new(),
     }
 }
 

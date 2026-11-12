@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0 — 2026-11-12
+
+### Added
+
+- Ordered route links (`--link iface[@ipv4][#ipv6]`, repeatable) with health
+  probes every `probe_interval_ms`. The first healthy link in the list carries
+  the profile's default route; three failed probes take a link down, two
+  successes bring it back, and a recovered higher-priority link takes over.
+  When every link is down the profile blackholes its traffic.
+- `status --json` reports a `links` array per profile with `interface`,
+  `gateway`, `gateway6`, `phase`, `healthy`, `active`, `rtt_ms`, and
+  `last_ok_unix`. The wire `api_version` is unchanged; the field defaults to
+  empty for older daemons.
+- `--link` is available on `add`, `open`, and `policy`, and conflicts with
+  `--route`, `--gateway`, and `--gateway6`.
+- `doctor` checks that the control socket is group `netscope`, mode `0660`,
+  and connectable, and that each route profile keeps its rules and blackhole
+  while a failover default is legitimately absent.
+- `probe_interval_ms`, `probe_target`, and `probe_target6` daemon config keys.
+
+### Fixed
+
+- `netscoped.service` keeps `CAP_CHOWN` so the control socket is handed to
+  group `netscope`; without it every unprivileged client was denied.
+- The health reconciler follows the link monitor's current winner instead of
+  resetting a switched default back to the first configured link.
+- Link probes bind to the probed interface, clear any inherited mark, and use
+  TCP with a one-second timeout, falling back to ICMP when the interface has
+  no global source address.
+
 ## 0.2.1 — 2026-11-04
 
 ### Fixed
