@@ -5,8 +5,9 @@ usage() {
     cat <<'EOF'
 usage: uninstall.sh [--purge] [--dry-run]
 
-Remove the netscope binaries, systemd unit, sysusers entry, and the
-netscope group. Runtime rules and cgroups are cleaned up first.
+Remove the netscope binaries, the netscope-gui desktop entry and icon, the
+systemd unit, sysusers entry, and the netscope group. Runtime rules and
+cgroups are cleaned up first.
 
   --purge     also remove /etc/netscope and /var/lib/netscope
   --dry-run   print every action without changing the system
@@ -55,10 +56,19 @@ else
 fi
 
 run rm -f /usr/bin/netscope /usr/bin/netscoped
+run rm -f /usr/bin/netscope-gui
+run rm -f /usr/share/applications/netscope-gui.desktop
+run rm -f /usr/share/icons/hicolor/256x256/apps/netscope-gui.png
 run rm -f /usr/lib/systemd/system/netscoped.service
 run rm -f /usr/lib/sysusers.d/netscope.conf
 run_ignore systemctl daemon-reload
 run_ignore groupdel netscope
+if command -v update-desktop-database >/dev/null 2>&1; then
+    run_ignore update-desktop-database /usr/share/applications
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    run_ignore gtk-update-icon-cache -f -t /usr/share/icons/hicolor
+fi
 
 if [ "$PURGE" = 1 ]; then
     run rm -rf /etc/netscope /var/lib/netscope /run/netscope
