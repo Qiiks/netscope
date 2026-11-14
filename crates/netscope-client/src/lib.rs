@@ -52,7 +52,7 @@ pub mod error;
 pub use client::{Client, DEFAULT_SOCKET_PATH};
 pub use error::ClientError;
 pub use netscope_linux::protocol::{
-    CloseResult, OpenScope, ProfileStatus, RequestOp, ScopeHandle, StatusData,
+    CloseResult, OpenScope, ProfileStats, ProfileStatus, RequestOp, ScopeHandle, StatusData,
 };
 pub use netscope_linux::types::{
     FilterDefault, Hold, LinkPhase, LinkStatus, PolicySpec, RouteLink, TargetSpec,

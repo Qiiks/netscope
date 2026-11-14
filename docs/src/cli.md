@@ -42,12 +42,19 @@ Prints the daemon version, pid, kernel, cgroup root, and one row per profile. Th
 ```text
 DAEMON  netscoped 0.3.0  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
-NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          PIDS
-blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        4242
-game       route   yes      wine:/games/Game/Game.exe   pre-open  cli               cli:route         5150
-running    route   yes      name:Overwatch.exe          late      cli               cli:route         6120
-shared     route   yes      name:Overwatch.exe          pre-exec  dropship,exitlink exitlink:route    7001
+NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          TRAFFIC               PIDS
+blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        ↓ 0 B/s ↑ 2.1 kB/s   4242
+game       route   yes      wine:/games/Game/Game.exe   pre-open  cli               cli:route         ↓ 3.2 MB/s ↑ 420 kB/s 5150
+running    route   yes      name:Overwatch.exe          late      cli               cli:route         ↓ 840 kB/s ↑ 96 kB/s  6120
+shared     route   yes      name:Overwatch.exe          pre-exec  dropship,exitlink exitlink:route    —                     7001
 ```
+
+`TRAFFIC` shows smoothed download (`↓`) and upload (`↑`) byte rates for the
+profile: counts are `seen_*` (client to network) for upload and `rx_*`
+(inbound) for download. The column is `—` when the profile has no counters —
+it is disabled, removed, or has no policy, or the daemon predates them. Rates
+are sampled once per second and decay toward zero while idle; `--json` keeps
+the full counters in `stats`.
 
 A profile with ordered links prints one indented line per link after its row:
 `link <iface> <gateway> <phase> <rtt> <active>`, where `-` stands in for a

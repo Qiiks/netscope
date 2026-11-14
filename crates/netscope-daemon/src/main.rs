@@ -7,17 +7,17 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use netscope_linux::cgroup::{self, AttachSource, CgroupError, CgroupManager};
 use netscope_linux::fanotify::{Fanotify, FanotifyError};
 use netscope_linux::ip;
 use netscope_linux::links::{self, LinkMonitor, ProbeConfig, ProbeOutcome};
-use netscope_linux::nft::NftManager;
+use netscope_linux::nft::{CounterSnapshot, NftManager};
 use netscope_linux::proc;
 use netscope_linux::protocol::{
-    AddProfile, CloseResult, OpenScope, ProfileStatus, Request, RequestOp, Response, ScopeHandle,
-    StatusData, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    AddProfile, CloseResult, OpenScope, ProfileStats, ProfileStatus, Request, RequestOp, Response,
+    ScopeHandle, StatusData, API_VERSION, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 use netscope_linux::run;
 use netscope_linux::sockets::{self, SocketMarkError};
@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 const USAGE: &str = "\
 usage: netscoped [--config <path>] [--foreground] [--log-level <level>]
@@ -64,6 +65,7 @@ struct Rt {
     inner: Mutex<Inner>,
     shutting_down: AtomicBool,
     next_connection: AtomicU64,
+    started_unix: u64,
 }
 
 struct Inner {
@@ -72,6 +74,63 @@ struct Inner {
     marked: HashMap<ProfileId, HashSet<u32>>,
     health: HashMap<String, bool>,
     links: HashMap<ProfileId, LinkMonitor>,
+    stats: HashMap<ProfileId, StatsState>,
+}
+
+#[derive(Debug, Default)]
+struct StatsState {
+    last: CounterSnapshot,
+    totals: CounterSnapshot,
+    tx_rate_bps: u64,
+    rx_rate_bps: u64,
+}
+
+impl StatsState {
+    /// Folds one tick into monotonic totals and the EWMA rates.
+    ///
+    /// A counter that went backwards means the table was recreated; the raw
+    /// value is then the delta for this window and totals keep growing.
+    fn sample(&mut self, current: CounterSnapshot, elapsed: Duration) {
+        let tx = delta(current.tx_bytes, self.last.tx_bytes);
+        let rx = delta(current.rx_bytes, self.last.rx_bytes);
+        let dropped = delta(current.dropped_bytes, self.last.dropped_bytes);
+        self.totals.tx_bytes = self.totals.tx_bytes.saturating_add(tx);
+        self.totals.rx_bytes = self.totals.rx_bytes.saturating_add(rx);
+        self.totals.dropped_bytes = self.totals.dropped_bytes.saturating_add(dropped);
+        self.totals.tx_packets = self
+            .totals
+            .tx_packets
+            .saturating_add(delta(current.tx_packets, self.last.tx_packets));
+        self.totals.rx_packets = self
+            .totals
+            .rx_packets
+            .saturating_add(delta(current.rx_packets, self.last.rx_packets));
+        self.totals.dropped_packets = self
+            .totals
+            .dropped_packets
+            .saturating_add(delta(current.dropped_packets, self.last.dropped_packets));
+        // The first tick of an interval fires immediately; a rate needs a
+        // measurable span or it reports a spike from the initial raw value.
+        if elapsed >= Duration::from_millis(500) {
+            let seconds = elapsed.as_secs_f64();
+            self.tx_rate_bps = ewma(self.tx_rate_bps, tx as f64 * 8.0 / seconds);
+            self.rx_rate_bps = ewma(self.rx_rate_bps, rx as f64 * 8.0 / seconds);
+        }
+        self.last = current;
+    }
+}
+
+fn delta(current: u64, previous: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
+fn ewma(previous: u64, sample: f64) -> u64 {
+    const ALPHA: f64 = 0.3;
+    (ALPHA * sample + (1.0 - ALPHA) * previous as f64).round() as u64
 }
 
 #[tokio::main]
@@ -124,6 +183,9 @@ async fn async_main() -> Result<(), String> {
 
     let poll_interval = Duration::from_millis(cfg.daemon.poll_interval_ms);
     let refresh_interval = Duration::from_secs(cfg.daemon.refresh_interval_secs);
+    let started_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
     let rt = Arc::new(Rt {
         cfg,
         config_path,
@@ -137,9 +199,11 @@ async fn async_main() -> Result<(), String> {
             marked: HashMap::new(),
             health: HashMap::new(),
             links: HashMap::new(),
+            stats: HashMap::new(),
         }),
         shutting_down: AtomicBool::new(false),
         next_connection: AtomicU64::new(1),
+        started_unix,
     });
 
     {
@@ -178,6 +242,7 @@ async fn async_main() -> Result<(), String> {
     let poll_handle = tokio::spawn(poll_task(rt.clone(), poll_interval));
     let refresh_handle = tokio::spawn(refresh_task(rt.clone(), refresh_interval));
     let health_handle = tokio::spawn(health_task(rt.clone()));
+    let stats_handle = tokio::spawn(stats_task(rt.clone()));
     let link_handle = tokio::spawn(link_task(rt.clone()));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -219,6 +284,7 @@ async fn async_main() -> Result<(), String> {
     poll_handle.abort();
     refresh_handle.abort();
     health_handle.abort();
+    stats_handle.abort();
     link_handle.abort();
     if let Some(handle) = exec_handle {
         handle.abort();
@@ -1284,7 +1350,7 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
                 info!("health repaired profile={id} component=cgroup");
             }
             match rt.nft.apply(&profile) {
-                Ok(()) => info!("health repaired profile={id} component=nft"),
+                Ok(_) => info!("health repaired profile={id} component=nft"),
                 Err(err) => {
                     warn!("health profile={id} nft error={err}");
                     healthy = false;
@@ -1295,7 +1361,7 @@ fn health_tick(rt: &Rt, inner: &mut Inner) {
             match rt.nft.exists(&profile) {
                 Ok(true) => {}
                 Ok(false) => match rt.nft.apply(&profile) {
-                    Ok(()) => info!("health repaired profile={id} component=nft"),
+                    Ok(_) => info!("health repaired profile={id} component=nft"),
                     Err(err) => {
                         warn!("health profile={id} nft error={err}");
                         healthy = false;
@@ -1416,6 +1482,50 @@ async fn health_task(rt: Arc<Rt>) {
         }
         let mut inner = rt.inner.lock().await;
         health_tick(&rt, &mut inner);
+    }
+}
+
+/// Samples every profile's named counters once per tick. Status requests only
+/// read the cached state, so they never spawn `nft`.
+async fn stats_task(rt: Arc<Rt>) {
+    let mut ticker = interval(STATS_INTERVAL);
+    let mut last_tick = Instant::now();
+    loop {
+        ticker.tick().await;
+        if rt.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let elapsed = last_tick.elapsed();
+        last_tick = Instant::now();
+        let probe = rt.clone();
+        let counters = match tokio::task::spawn_blocking(move || probe.nft.counters()).await {
+            Ok(Ok(counters)) => counters,
+            Ok(Err(err)) => {
+                warn!("stats: read counters: {err}");
+                continue;
+            }
+            Err(err) => {
+                warn!("stats: sampler failed: {err}");
+                continue;
+            }
+        };
+        let mut inner = rt.inner.lock().await;
+        let tables: Vec<(ProfileId, String)> = inner
+            .state
+            .profiles
+            .values()
+            .filter(|profile| profile.enabled && profile.has_policies())
+            .map(|profile| (profile.id.clone(), table_name(&profile.id)))
+            .collect();
+        for (id, table) in tables {
+            if let Some(snapshot) = counters.get(&table) {
+                inner
+                    .stats
+                    .entry(id)
+                    .or_default()
+                    .sample(*snapshot, elapsed);
+            }
+        }
     }
 }
 
@@ -2564,6 +2674,7 @@ fn teardown_profile(rt: &Rt, inner: &mut Inner, profile: &Profile) {
     inner.marked.remove(&profile.id);
     inner.state.profiles.remove(&profile.id);
     inner.health.remove(&profile.id);
+    inner.stats.remove(&profile.id);
     remove_loader_marks(rt, inner, profile);
 }
 
@@ -2680,6 +2791,21 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         None => "shared",
     }
     .to_string();
+    let stats = if profile.enabled && profile.has_policies() {
+        inner.stats.get(&profile.id).map(|state| ProfileStats {
+            tx_bytes: state.totals.tx_bytes,
+            rx_bytes: state.totals.rx_bytes,
+            tx_packets: state.totals.tx_packets,
+            rx_packets: state.totals.rx_packets,
+            tx_rate_bps: state.tx_rate_bps,
+            rx_rate_bps: state.rx_rate_bps,
+            dropped_bytes: state.totals.dropped_bytes,
+            dropped_packets: state.totals.dropped_packets,
+            since_unix: rt.started_unix,
+        })
+    } else {
+        None
+    };
     ProfileStatus {
         id: profile.id.clone(),
         mode,
@@ -2708,6 +2834,7 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
         policies,
         generation: profile.generation,
         links: link_statuses(inner, profile),
+        stats,
     }
 }
 
@@ -3434,6 +3561,43 @@ fn fanotify_active(rt: &Rt) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(tx: u64, rx: u64, dropped: u64) -> CounterSnapshot {
+        CounterSnapshot {
+            tx_bytes: tx,
+            rx_bytes: rx,
+            dropped_bytes: dropped,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stats_totals_grow_and_reset_uses_the_raw_delta() {
+        let mut state = StatsState::default();
+        state.sample(snapshot(1_000, 500, 10), Duration::from_secs(1));
+        assert_eq!(state.totals.tx_bytes, 1_000);
+        state.sample(snapshot(2_000, 900, 15), Duration::from_secs(1));
+        assert_eq!(state.totals.tx_bytes, 2_000);
+        assert_eq!(state.totals.rx_bytes, 900);
+        assert_eq!(state.totals.dropped_bytes, 15);
+        // A recreated table starts over; the raw value is this window's delta
+        // and the totals never move backwards.
+        state.sample(snapshot(120, 20, 0), Duration::from_secs(1));
+        assert_eq!(state.totals.tx_bytes, 2_120);
+        assert_eq!(state.totals.rx_bytes, 920);
+        assert_eq!(state.totals.dropped_bytes, 15);
+    }
+
+    #[test]
+    fn stats_rate_is_an_ewma_of_bits_per_second() {
+        let mut state = StatsState::default();
+        state.sample(snapshot(1_000, 0, 0), Duration::from_secs(1));
+        assert_eq!(state.tx_rate_bps, 2_400, "0.3 * 8000 bps");
+        state.sample(snapshot(2_000, 0, 0), Duration::from_secs(1));
+        assert_eq!(state.tx_rate_bps, 4_080);
+        state.sample(snapshot(3_000, 0, 0), Duration::from_millis(10));
+        assert_eq!(state.tx_rate_bps, 4_080, "short ticks keep the rate");
+    }
 
     #[test]
     fn cidr_validation_accepts_prefix_ranges() {

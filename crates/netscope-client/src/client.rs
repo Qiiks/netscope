@@ -265,6 +265,45 @@ impl Client {
         self.raw_request(RequestOp::Refresh).map(|_| ())
     }
 
+    /// Re-enables a disabled profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Daemon`] when the profile is missing or the
+    /// caller may not modify it.
+    pub fn enable(&mut self, profile: &str) -> Result<(), ClientError> {
+        self.raw_request(RequestOp::Enable {
+            name: profile.to_string(),
+        })
+        .map(|_| ())
+    }
+
+    /// Disables a profile without removing its definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Daemon`] when the profile is missing or the
+    /// caller may not modify it.
+    pub fn disable(&mut self, profile: &str) -> Result<(), ClientError> {
+        self.raw_request(RequestOp::Disable {
+            name: profile.to_string(),
+        })
+        .map(|_| ())
+    }
+
+    /// Removes a profile, including its rules and routes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Daemon`] when the profile is missing or the
+    /// caller may not modify it.
+    pub fn remove(&mut self, profile: &str) -> Result<(), ClientError> {
+        self.raw_request(RequestOp::Remove {
+            name: profile.to_string(),
+        })
+        .map(|_| ())
+    }
+
     /// Sends one raw request and returns its raw `data` payload.
     ///
     /// This is the only method that does not interpret the reply, so it is the
@@ -359,6 +398,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
 
+    use netscope_linux::protocol::ProfileStats;
     use serde_json::json;
 
     use super::*;
@@ -448,6 +488,17 @@ mod tests {
             policies: vec!["filter".to_string()],
             generation: 7,
             links: Vec::new(),
+            stats: Some(ProfileStats {
+                tx_bytes: 1_024,
+                rx_bytes: 512,
+                tx_packets: 8,
+                rx_packets: 4,
+                tx_rate_bps: 4_096,
+                rx_rate_bps: 2_048,
+                dropped_bytes: 0,
+                dropped_packets: 0,
+                since_unix: 1_700_000_000,
+            }),
         }
     }
 
@@ -615,6 +666,40 @@ mod tests {
 
         let request = handle.join().expect("mock responder");
         assert_eq!(request.id, 1);
+    }
+
+    #[test]
+    fn lifecycle_helpers_send_their_ops() {
+        let cases: [(&str, RequestOp, fn(&mut Client) -> Result<(), ClientError>); 3] = [
+            (
+                "enable",
+                RequestOp::Enable {
+                    name: "game".to_string(),
+                },
+                |client| client.enable("game"),
+            ),
+            (
+                "disable",
+                RequestOp::Disable {
+                    name: "game".to_string(),
+                },
+                |client| client.disable("game"),
+            ),
+            (
+                "remove",
+                RequestOp::Remove {
+                    name: "game".to_string(),
+                },
+                |client| client.remove("game"),
+            ),
+        ];
+        for (name, expected, call) in cases {
+            let (socket, listener) = mock(name);
+            let handle = responder(listener, |_| ok(1, json!({})));
+            let mut client = Client::connect_at(&socket.path).expect("connect mock");
+            call(&mut client).expect(name);
+            assert_eq!(handle.join().expect("mock responder").op, expected);
+        }
     }
 
     #[test]
