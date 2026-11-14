@@ -1437,12 +1437,12 @@ fn policy_panel_add(s: &State, k: &Kit) -> El {
                         .h(30.0)
                         .child(ui::faint(k, "No link chosen yet."))
                 } else {
-                    col()
-                        .w_full()
-                        .gap(4.0)
-                        .children(s.add_route.iter().enumerate().map(|(index, link)| {
-                            route_row(s, k, index, link)
-                        }))
+                    col().w_full().gap(4.0).children(
+                        s.add_route
+                            .iter()
+                            .enumerate()
+                            .map(|(index, link)| route_row(s, k, index, link)),
+                    )
                 })
                 .child(
                     row()
