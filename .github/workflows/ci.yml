@@ -15,7 +15,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system tools
-        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 zstd
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 zstd libxkbcommon-dev libwayland-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
