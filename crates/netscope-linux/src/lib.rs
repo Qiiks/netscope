@@ -2,6 +2,7 @@ pub mod cgroup;
 pub mod command;
 pub mod fanotify;
 pub mod ip;
+pub mod links;
 pub mod nft;
 pub mod proc;
 pub mod protocol;

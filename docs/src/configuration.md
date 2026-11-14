@@ -13,6 +13,9 @@ poll_interval_ms = 1000
 refresh_interval_secs = 5
 max_profiles = 32
 log_level = "info"
+probe_interval_ms = 2000
+probe_target = "1.1.1.1:443"
+probe_target6 = "[2606:4700:4700::1111]:443"
 ```
 
 ## Keys
@@ -26,6 +29,9 @@ log_level = "info"
 | `refresh_interval_secs` | `5` | How often targets are re-resolved and matching processes are attached. Bounded to 1–300. |
 | `max_profiles` | `32` | Profile ceiling, 1–32. Lowering it prevents new profiles above the new limit. |
 | `log_level` | `info` | `error`, `warn`, `info`, `debug`, or `trace`. |
+| `probe_interval_ms` | `2000` | How often ordered links are probed for failover. Bounded to 500–60000 ms. |
+| `probe_target` | `1.1.1.1:443` | IPv4 `address:port` used for link probes. |
+| `probe_target6` | `[2606:4700:4700::1111]:443` | IPv6 target for link probes; only used when the profile carries IPv6 and a link has a global IPv6 source address. |
 
 Unknown keys are rejected. The file is parsed with `deny_unknown_fields`, so a typo such as `poll_interval` stops the daemon instead of being silently ignored. Check the journal after editing:
 

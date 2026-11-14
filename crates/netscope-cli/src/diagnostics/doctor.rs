@@ -81,6 +81,7 @@ pub(crate) fn run_checks(socket: &Path) -> Vec<Check> {
         check_cgroup2(),
         check_tools(),
         check_daemon(socket),
+        check_control_socket(socket),
     ];
     checks.push(check_state(
         &config,
@@ -319,13 +320,23 @@ fn validate_config(value: &toml::Value) -> Vec<String> {
             "refresh_interval_secs",
             "max_profiles",
             "log_level",
+            "probe_interval_ms",
+            "probe_target",
+            "probe_target6",
         ]
         .contains(&key.as_str())
         {
             problems.push(format!("config: unknown field `daemon.{key}`"));
         }
     }
-    for key in ["socket_path", "state_path", "cgroup_root", "log_level"] {
+    for key in [
+        "socket_path",
+        "state_path",
+        "cgroup_root",
+        "log_level",
+        "probe_target",
+        "probe_target6",
+    ] {
         if daemon
             .get(key)
             .is_some_and(|value| value.as_str().is_none())
@@ -337,6 +348,7 @@ fn validate_config(value: &toml::Value) -> Vec<String> {
         ("poll_interval_ms", 100, 10_000),
         ("refresh_interval_secs", 1, 300),
         ("max_profiles", 1, 32),
+        ("probe_interval_ms", 500, 60_000),
     ];
     for (key, low, high) in ranges {
         let Some(value) = daemon.get(key) else {
@@ -360,6 +372,75 @@ fn load_state(path: &Path) -> Result<Option<State>, String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(format!("read {}: {err}", path.display())),
     }
+}
+
+/// The socket must be group `netscope`, mode 0660, and connectable by this
+/// process; a root:root socket denies every unprivileged client.
+fn check_control_socket(socket: &Path) -> Check {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match fs::metadata(socket) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return check(
+                "control socket",
+                Status::Fail,
+                "missing; start netscoped (systemctl start netscoped)",
+            )
+        }
+        Err(err) => {
+            return check(
+                "control socket",
+                Status::Fail,
+                format!("cannot stat {}: {err}", socket.display()),
+            )
+        }
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let gid = meta.gid();
+    let want = group_gid("netscope");
+    let mut problems = Vec::new();
+    if want != Some(gid) {
+        problems.push(format!(
+            "owner group is gid {gid}, expected netscope{}",
+            want.map(|gid| format!(" (gid {gid})")).unwrap_or_default()
+        ));
+    }
+    if mode != 0o660 {
+        problems.push(format!("mode is {mode:o}, expected 660"));
+    }
+    if let Err(err) = std::os::unix::net::UnixStream::connect(socket) {
+        problems.push(format!("connect failed: {err}"));
+    }
+    if problems.is_empty() {
+        check(
+            "control socket",
+            Status::Pass,
+            format!("group netscope, mode {mode:o}, connectable"),
+        )
+    } else {
+        check(
+            "control socket",
+            Status::Fail,
+            format!(
+                "{}; fix: keep CAP_CHOWN in netscoped.service, restart it, and add the user to group netscope",
+                problems.join("; ")
+            ),
+        )
+    }
+}
+
+fn group_gid(name: &str) -> Option<u32> {
+    let text = fs::read_to_string("/etc/group").ok()?;
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next() != Some(name) {
+            return None;
+        }
+        let _password = fields.next();
+        fields.next()?.parse().ok()
+    })
 }
 
 fn check_state(
@@ -475,9 +556,35 @@ fn validate_state(state: &State, max_profiles: u8) -> Vec<String> {
                     interface,
                     gateway,
                     gateway6,
+                    links,
                     except,
                     ..
                 } => {
+                    if links.len() > 8 {
+                        problems.push(format!("profile '{id}' has more than 8 links"));
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    for link in links {
+                        if link.interface.is_empty() {
+                            problems.push(format!("profile '{id}' has an empty link interface"));
+                        }
+                        if !seen.insert(&link.interface) {
+                            problems.push(format!(
+                                "profile '{id}' repeats link interface '{}'",
+                                link.interface
+                            ));
+                        }
+                        if link.gateway.as_deref().is_some_and(|gateway| {
+                            gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv4())
+                        }) {
+                            problems.push(format!("profile '{id}' has invalid link IPv4 gateway"));
+                        }
+                        if link.gateway6.as_deref().is_some_and(|gateway| {
+                            gateway.parse::<IpAddr>().map_or(true, |ip| !ip.is_ipv6())
+                        }) {
+                            problems.push(format!("profile '{id}' has invalid link IPv6 gateway"));
+                        }
+                    }
                     if interface.is_empty() {
                         problems.push(format!("profile '{id}' has an empty interface"));
                     }
@@ -564,7 +671,9 @@ fn check_profile_runtime(config: &Config, state: Option<&State>) -> Check {
             }
         }
         if profile.has_route() {
-            match ip::exists(profile) {
+            // A failover profile legitimately has no tunnel default while
+            // every link is down, so only the rules and blackhole are required.
+            match ip::installed(profile) {
                 Ok(true) => {}
                 Ok(false) => problems.push(format!("{}: missing ip rule/route", profile.id)),
                 Err(err) => problems.push(format!("{}: ip: {err}", profile.id)),

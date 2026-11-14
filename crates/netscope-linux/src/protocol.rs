@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Hold, PolicySpec, TargetSpec};
+use crate::types::{Hold, LinkStatus, PolicySpec, TargetSpec};
 
 pub const API_VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -156,4 +156,8 @@ pub struct ProfileStatus {
     pub policies: Vec<String>,
     #[serde(default)]
     pub generation: u64,
+    /// Ordered route links. Empty for filter-only profiles and for daemons
+    /// older than 0.3.0.
+    #[serde(default)]
+    pub links: Vec<LinkStatus>,
 }

@@ -40,7 +40,7 @@ netscope status [--json]
 Prints the daemon version, pid, kernel, cgroup root, and one row per profile. The text form has a daemon header and the same columns as `list`:
 
 ```text
-DAEMON  netscoped 0.2.1  pid 1234  kernel 6.11.0-arch1-1
+DAEMON  netscoped 0.3.0  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
 NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          PIDS
 blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        4242
@@ -49,7 +49,10 @@ running    route   yes      name:Overwatch.exe          late      cli           
 shared     route   yes      name:Overwatch.exe          pre-exec  dropship,exitlink exitlink:route    7001
 ```
 
-The state path and config path are available in `--json` output.
+A profile with ordered links prints one indented line per link after its row:
+`link <iface> <gateway> <phase> <rtt> <active>`, where `-` stands in for a
+missing gateway or RTT and `active` marks the link currently carrying the
+default route. The state path and config path are available in `--json` output.
 
 `ATTACHED` is `pre-exec` when only the native exec hook placed processes, `pre-open` when only the Wine open hook did, and `late` when only the poll fallback did. It is `mixed` when a pre-attach source (`pre-exec` or `pre-open`) and the poll fallback are both present, and `none` when no process is attached. A Wine profile shows its target as `wine:<path>`; a process-name profile shows `name:<name>`. `PIDS` is a comma-separated list.
 
@@ -66,13 +69,13 @@ Prints the profile table without the daemon header. Disabled profiles are includ
 ## `add`
 
 ```text
-netscope add <name> --exe <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
-netscope add <name> --wine <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
-netscope add <name> --process <name> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
-netscope add <name> --steam <appid> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS])
+netscope add <name> --exe <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS] | --link <spec> [ROUTE OPTIONS])
+netscope add <name> --wine <path> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS] | --link <spec> [ROUTE OPTIONS])
+netscope add <name> --process <name> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS] | --link <spec> [ROUTE OPTIONS])
+netscope add <name> --steam <appid> (--filter <drop|allow> [CIDR OPTIONS] | --route <iface> [ROUTE OPTIONS] | --link <spec> [ROUTE OPTIONS])
 ```
 
-Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` is required, and exactly one of `--filter` and `--route` is required.
+Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` is required, and exactly one of `--filter`, `--route`, and `--link` is required.
 
 | Option | Applies to | Meaning |
 |---|---|---|
@@ -84,6 +87,7 @@ Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` 
 | `--allow-cidr <cidr>` | `--filter drop` | Destination to keep reachable. Repeatable. |
 | `--deny-cidr <cidr>` | `--filter allow` | Destination to drop. Repeatable; at least one is required. |
 | `--route <iface>` | Route profiles | Tunnel interface. |
+| `--link <spec>` | Route profiles | Ordered link: `<iface>`, `<iface>@<ipv4>`, `<iface>#<ipv6>`, or `<iface>@<ipv4>#<ipv6>`. Repeatable, up to 8; the first healthy link carries the default route. Conflicts with `--route`. |
 | `--gateway <ipv4>` | `--route` | IPv4 next hop. |
 | `--gateway6 <ipv6>` | `--route --allow-ipv6` | IPv6 next hop. |
 | `--include-lan` | `--route` | Route LAN destinations instead of bypassing them. |
@@ -101,9 +105,11 @@ Rules enforced before the daemon is asked:
 - `--process` takes a name, not a path. It is matched against the process `comm` and its executable basename, and against any argv basename of a Wine loader; `Overwatch`, `Overwatch.exe`, and `overwatch.exe` are the same target. A new Wine/Proton launch is caught by the loader hold before its first socket; an already-running process attaches on the poll and has its existing sockets marked.
 - `--allow-cidr` is rejected with `--filter allow`.
 - `--deny-cidr` is rejected with `--filter drop`, and `--filter allow` needs at least one.
+- `--link` conflicts with `--route`, `--gateway`, and `--gateway6`; per-link gateways belong inside the spec. Interfaces must be unique and at most eight are accepted.
+- An IPv6 half (`#<ipv6>`) requires `--allow-ipv6`.
 - `--gateway` is rejected outside `--route`.
 - `--gateway6` is rejected without `--allow-ipv6`.
-- `--include-lan`, `--allow-ipv6`, `--udp`, `--except-port`, `--except-sport`, and `--except` are rejected outside `--route`.
+- `--include-lan`, `--allow-ipv6`, `--udp`, `--except-port`, `--except-sport`, and `--except` are accepted with either `--route` or `--link`.
 - `--except-port` requires `--udp` and takes 32 ports; port `0` is rejected.
 - `--except-sport` requires `--udp` and takes 64 ports; port `0` is rejected. Pinned sockets are never marked and their packets are accepted before the mark rule, so a flow that already existed when the profile opened keeps its normal route. A socket keeps its source port for its whole life, so the pin holds until the process exits.
 - `--except` takes up to 30 CIDRs. The daemon installs each as an `ip rule` to `main` at a lower priority than the mark rule.
@@ -131,7 +137,7 @@ For a Wine target the profile attaches when a Wine process opens the PE, which i
 
 ```text
 netscope open --consumer <id> [--name <profile>] <TARGET> [POLICY]
-netscope policy <profile> --consumer <id> (--filter ... | --route ...)
+netscope policy <profile> --consumer <id> (--filter ... | --route ... | --link ...)
 netscope close <profile> --consumer <id>
 netscope resolve (--profile <id> | <TARGET>)
 ```
@@ -162,6 +168,8 @@ sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe 
   --deny-cidr 64.224.26.0/23
 sudo netscope policy overwatch --consumer exitlink --route tun0 \
   --except 203.0.113.0/24
+sudo netscope --uid "$(id -u)" open --consumer exitlink --name failover \
+  --process Overwatch.exe --link enp7s0f4u1 --link wwan0@10.64.0.1
 sudo netscope close overwatch --consumer dropship
 ```
 
@@ -198,7 +206,7 @@ Forces an immediate target re-stat and attach pass instead of waiting for `refre
 netscope doctor [--json]
 ```
 
-Runs seven checks: `root`, `kernel`, `cgroup v2`, `tools` (nftables and iproute2), `daemon` (connectivity and API version), `state + config`, and `profiles` (per-profile runtime). It exits `0` only when no check fails; warnings do not change the exit code.
+Runs eight checks: `root`, `kernel`, `cgroup v2`, `tools` (nftables and iproute2), `daemon` (connectivity and API version), `control socket` (group `netscope`, mode `0660`, connectable), `state + config`, and `profiles` (per-profile runtime). It exits `0` only when no check fails; warnings do not change the exit code.
 
 A non-root run **fails the `root` check and exits `1`**. Other privileged probes that need root report `SKIP`. Run it with `sudo netscope doctor` for the complete report.
 

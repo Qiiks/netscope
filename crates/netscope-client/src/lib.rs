@@ -54,4 +54,6 @@ pub use error::ClientError;
 pub use netscope_linux::protocol::{
     CloseResult, OpenScope, ProfileStatus, RequestOp, ScopeHandle, StatusData,
 };
-pub use netscope_linux::types::{FilterDefault, Hold, PolicySpec, TargetSpec};
+pub use netscope_linux::types::{
+    FilterDefault, Hold, LinkPhase, LinkStatus, PolicySpec, RouteLink, TargetSpec,
+};

@@ -113,6 +113,11 @@ enum Cmd {
         .multiple(false)
         .args(["exe", "wine", "process", "steam"]),
 ))]
+#[command(group(
+    ArgGroup::new("route_mode")
+        .multiple(false)
+        .args(["route", "link"]),
+))]
 struct AddArgs {
     name: String,
     #[arg(long, value_name = "PATH")]
@@ -127,40 +132,43 @@ struct AddArgs {
         long,
         value_name = "DEFAULT",
         value_parser = ["drop", "allow"],
-        conflicts_with = "route",
-        required_unless_present = "route"
+        conflicts_with_all = ["route", "link"],
+        required_unless_present_any = ["route", "link"]
     )]
     filter: Option<String>,
     #[arg(
         long,
         value_name = "IFACE",
-        conflicts_with = "filter",
-        required_unless_present = "filter"
+        conflicts_with_all = ["filter", "link"],
+        required_unless_present_any = ["filter", "link"]
     )]
     route: Option<String>,
+    /// Ordered route link: <iface>[@<ipv4>][#<ipv6>] (repeatable, max 8)
+    #[arg(long = "link", value_name = "LINK", conflicts_with_all = ["filter", "route"])]
+    link: Vec<String>,
     #[arg(long = "allow-cidr", value_name = "CIDR")]
     allow_cidr: Vec<String>,
     #[arg(long = "deny-cidr", value_name = "CIDR")]
     deny_cidr: Vec<String>,
-    #[arg(long = "except", value_name = "CIDR", requires = "route")]
+    #[arg(long = "except", value_name = "CIDR", requires = "route_mode")]
     except_cidr: Vec<String>,
     #[arg(long, value_name = "IPV4", requires = "route")]
     gateway: Option<String>,
     #[arg(long, value_name = "IPV6", requires = "allow_ipv6")]
     gateway6: Option<String>,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     include_lan: bool,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     allow_ipv6: bool,
     /// Mark only IPv4 UDP; TCP keeps its normal route
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     udp: bool,
     /// UDP destination port that stays direct (repeatable)
-    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-port", value_name = "PORT", requires = "route_mode")]
     except_port: Vec<u16>,
     /// UDP source port that already had a flow when the route opened and must
     /// stay direct (repeatable)
-    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route_mode")]
     except_sport: Vec<u16>,
 }
 
@@ -183,6 +191,11 @@ struct TargetArgs {
         .multiple(false)
         .args(["exe", "wine", "process", "steam"]),
 ))]
+#[command(group(
+    ArgGroup::new("route_mode")
+        .multiple(false)
+        .args(["route", "link"]),
+))]
 struct OpenArgs {
     #[arg(long)]
     consumer: String,
@@ -190,37 +203,54 @@ struct OpenArgs {
     name: Option<String>,
     #[command(flatten)]
     target: TargetArgs,
-    #[arg(long, value_name = "DEFAULT", value_parser = ["drop", "allow"], conflicts_with = "route")]
+    #[arg(
+        long,
+        value_name = "DEFAULT",
+        value_parser = ["drop", "allow"],
+        conflicts_with_all = ["route", "link"]
+    )]
     filter: Option<String>,
-    #[arg(long, value_name = "IFACE", conflicts_with = "filter")]
+    #[arg(
+        long,
+        value_name = "IFACE",
+        conflicts_with_all = ["filter", "link"]
+    )]
     route: Option<String>,
+    /// Ordered route link: <iface>[@<ipv4>][#<ipv6>] (repeatable, max 8)
+    #[arg(long = "link", value_name = "LINK", conflicts_with_all = ["filter", "route"])]
+    link: Vec<String>,
     #[arg(long = "allow-cidr", value_name = "CIDR")]
     allow_cidr: Vec<String>,
     #[arg(long = "deny-cidr", value_name = "CIDR")]
     deny_cidr: Vec<String>,
-    #[arg(long = "except", value_name = "CIDR", requires = "route")]
+    #[arg(long = "except", value_name = "CIDR", requires = "route_mode")]
     except_cidr: Vec<String>,
     #[arg(long, value_name = "IPV4", requires = "route")]
     gateway: Option<String>,
     #[arg(long, value_name = "IPV6", requires = "allow_ipv6")]
     gateway6: Option<String>,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     include_lan: bool,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     allow_ipv6: bool,
     /// Mark only IPv4 UDP; TCP keeps its normal route
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     udp: bool,
     /// UDP destination port that stays direct (repeatable)
-    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-port", value_name = "PORT", requires = "route_mode")]
     except_port: Vec<u16>,
     /// UDP source port that already had a flow when the route opened and must
     /// stay direct (repeatable)
-    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route_mode")]
     except_sport: Vec<u16>,
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("route_mode")
+        .multiple(false)
+        .args(["route", "link"]),
+))]
 struct PolicyArgs {
     profile: String,
     #[arg(long)]
@@ -229,40 +259,43 @@ struct PolicyArgs {
         long,
         value_name = "DEFAULT",
         value_parser = ["drop", "allow"],
-        conflicts_with = "route",
-        required_unless_present = "route"
+        conflicts_with_all = ["route", "link"],
+        required_unless_present_any = ["route", "link"]
     )]
     filter: Option<String>,
     #[arg(
         long,
         value_name = "IFACE",
-        conflicts_with = "filter",
-        required_unless_present = "filter"
+        conflicts_with_all = ["filter", "link"],
+        required_unless_present_any = ["filter", "link"]
     )]
     route: Option<String>,
+    /// Ordered route link: <iface>[@<ipv4>][#<ipv6>] (repeatable, max 8)
+    #[arg(long = "link", value_name = "LINK", conflicts_with_all = ["filter", "route"])]
+    link: Vec<String>,
     #[arg(long = "allow-cidr", value_name = "CIDR")]
     allow_cidr: Vec<String>,
     #[arg(long = "deny-cidr", value_name = "CIDR")]
     deny_cidr: Vec<String>,
-    #[arg(long = "except", value_name = "CIDR", requires = "route")]
+    #[arg(long = "except", value_name = "CIDR", requires = "route_mode")]
     except_cidr: Vec<String>,
     #[arg(long, value_name = "IPV4", requires = "route")]
     gateway: Option<String>,
     #[arg(long, value_name = "IPV6", requires = "allow_ipv6")]
     gateway6: Option<String>,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     include_lan: bool,
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     allow_ipv6: bool,
     /// Mark only IPv4 UDP; TCP keeps its normal route
-    #[arg(long, requires = "route")]
+    #[arg(long, requires = "route_mode")]
     udp: bool,
     /// UDP destination port that stays direct (repeatable)
-    #[arg(long = "except-port", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-port", value_name = "PORT", requires = "route_mode")]
     except_port: Vec<u16>,
     /// UDP source port that already had a flow when the route opened and must
     /// stay direct (repeatable)
-    #[arg(long = "except-sport", value_name = "PORT", requires = "route")]
+    #[arg(long = "except-sport", value_name = "PORT", requires = "route_mode")]
     except_sport: Vec<u16>,
 }
 
@@ -343,6 +376,7 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
         steam: args.steam,
         filter: args.filter,
         route: args.route,
+        links: args.link,
         allow_cidrs: args.allow_cidr,
         deny_cidrs: args.deny_cidr,
         except_cidrs: args.except_cidr,
@@ -364,9 +398,10 @@ fn add(args: AddArgs, uid: Option<u32>, socket: &Path) -> i32 {
 fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
     if args.filter.is_none()
         && args.route.is_none()
+        && args.link.is_empty()
         && (!args.allow_cidr.is_empty() || !args.deny_cidr.is_empty())
     {
-        return usage("--allow-cidr and --deny-cidr need --filter or --route");
+        return usage("--allow-cidr and --deny-cidr need --filter, --route, or --link");
     }
     let target_uid = match resolve_target_uid(uid) {
         Ok(uid) => uid,
@@ -380,6 +415,7 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
         steam: args.target.steam,
         filter: args.filter.clone(),
         route: args.route.clone(),
+        links: args.link.clone(),
         allow_cidrs: args.allow_cidr.clone(),
         deny_cidrs: args.deny_cidr.clone(),
         except_cidrs: args.except_cidr.clone(),
@@ -396,21 +432,24 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
         Ok(target) => target,
         Err(message) => return usage(&message),
     };
-    let policy = if args.filter.is_some() || args.route.is_some() {
-        match commands::validate_mode(commands::ModeInput {
-            filter: args.filter.as_deref(),
-            route: args.route.as_deref(),
-            allow_cidrs: &args.allow_cidr,
-            deny_cidrs: &args.deny_cidr,
-            except_cidrs: &args.except_cidr,
-            gateway: args.gateway.as_deref(),
-            gateway6: args.gateway6.as_deref(),
-            include_lan: args.include_lan,
-            allow_ipv6: args.allow_ipv6,
-            udp_only: args.udp,
-            except_ports: &args.except_port,
-            except_sports: &args.except_sport,
-        }) {
+    let policy = if args.filter.is_some() || args.route.is_some() || !args.link.is_empty() {
+        match commands::validate_mode_links(
+            commands::ModeInput {
+                filter: args.filter.as_deref(),
+                route: args.route.as_deref(),
+                allow_cidrs: &args.allow_cidr,
+                deny_cidrs: &args.deny_cidr,
+                except_cidrs: &args.except_cidr,
+                gateway: args.gateway.as_deref(),
+                gateway6: args.gateway6.as_deref(),
+                include_lan: args.include_lan,
+                allow_ipv6: args.allow_ipv6,
+                udp_only: args.udp,
+                except_ports: &args.except_port,
+                except_sports: &args.except_sport,
+            },
+            &args.link,
+        ) {
             Ok(policy) => Some(policy),
             Err(message) => return usage(&message),
         }
@@ -431,20 +470,23 @@ fn open(args: OpenArgs, uid: Option<u32>, socket: &Path) -> i32 {
 }
 
 fn policy(args: PolicyArgs, socket: &Path) -> i32 {
-    let policy = match commands::validate_mode(commands::ModeInput {
-        filter: args.filter.as_deref(),
-        route: args.route.as_deref(),
-        allow_cidrs: &args.allow_cidr,
-        deny_cidrs: &args.deny_cidr,
-        except_cidrs: &args.except_cidr,
-        gateway: args.gateway.as_deref(),
-        gateway6: args.gateway6.as_deref(),
-        include_lan: args.include_lan,
-        allow_ipv6: args.allow_ipv6,
-        udp_only: args.udp,
-        except_ports: &args.except_port,
-        except_sports: &args.except_sport,
-    }) {
+    let policy = match commands::validate_mode_links(
+        commands::ModeInput {
+            filter: args.filter.as_deref(),
+            route: args.route.as_deref(),
+            allow_cidrs: &args.allow_cidr,
+            deny_cidrs: &args.deny_cidr,
+            except_cidrs: &args.except_cidr,
+            gateway: args.gateway.as_deref(),
+            gateway6: args.gateway6.as_deref(),
+            include_lan: args.include_lan,
+            allow_ipv6: args.allow_ipv6,
+            udp_only: args.udp,
+            except_ports: &args.except_port,
+            except_sports: &args.except_sport,
+        },
+        &args.link,
+    ) {
         Ok(policy) => policy,
         Err(message) => return usage(&message),
     };

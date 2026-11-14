@@ -185,6 +185,10 @@ consumer is terminal for that packet.
   "interface": "tun0",
   "gateway": null,
   "gateway6": null,
+  "links": [
+    {"interface": "enp7s0f4u1", "gateway": null, "gateway6": null},
+    {"interface": "wwan0", "gateway": "10.64.0.1", "gateway6": null}
+  ],
   "include_lan": false,
   "allow_ipv6": false,
   "udp_only": false,
@@ -199,6 +203,7 @@ consumer is terminal for that packet.
 | `interface` | string | Tunnel interface to route through. |
 | `gateway` | string or null | Optional IPv4 next hop. |
 | `gateway6` | string or null | Optional IPv6 next hop; requires `allow_ipv6`. |
+| `links` | array of RouteLink | Ordered failover links. Empty or omitted means the `interface`/`gateway`/`gateway6` mirror is the only link. Each entry has `interface`, `gateway` (string or null), and `gateway6` (string or null). At most 8, unique interfaces. |
 | `include_lan` | bool | Route LAN destinations instead of bypassing them. Defaults to `false`. |
 | `allow_ipv6` | bool | Carry IPv6; without it, IPv6 is dropped. Defaults to `false`. |
 | `udp_only` | bool | Mark only IPv4 UDP; TCP keeps the host's normal path. Defaults to `false`. |
@@ -285,6 +290,7 @@ Daemon identity and the full profile list.
 | `consumers` | Consumer ids holding a claim. |
 | `policies` | Policy summaries, one per consumer: `<consumer>:filter` or `<consumer>:route`. |
 | `generation` | Incremented when a claim or policy changes; useful for change detection. |
+| `links` | Route links with probe state: `interface`, `gateway`, `gateway6`, `phase` (`up`/`down`), `healthy` (true when up), `active` (carrying the default route), `rtt_ms`, and `last_ok_unix`. Empty for filter profiles and for daemons older than 0.3.0. |
 
 ### `open`
 
@@ -637,8 +643,8 @@ connection), `Daemon` (the daemon replied `ok: false`, message preserved),
 `Protocol` (bad JSON, oversized response, or mismatched id), and `Io`.
 
 Re-exports include `Hold`, `TargetSpec`, `PolicySpec`, `FilterDefault`,
-`OpenScope`, `ScopeHandle`, `CloseResult`, `StatusData`, `ProfileStatus`, and
-`RequestOp`.
+`RouteLink`, `LinkPhase`, `LinkStatus`, `OpenScope`, `ScopeHandle`,
+`CloseResult`, `StatusData`, `ProfileStatus`, and `RequestOp`.
 
 ## Python client
 

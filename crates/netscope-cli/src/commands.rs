@@ -6,7 +6,9 @@ use netscope_linux::protocol::{
     AddProfile, CloseResult, OpenScope, ProfileStatus, RequestOp, ScopeHandle, StatusData,
     API_VERSION,
 };
-use netscope_linux::types::{profile_id_valid, FilterDefault, ModeSpec, ProfileId, TargetSpec};
+use netscope_linux::types::{
+    profile_id_valid, FilterDefault, ModeSpec, ProfileId, RouteLink, TargetSpec,
+};
 use serde_json::Value;
 
 use crate::client::{self, ClientError};
@@ -20,6 +22,7 @@ pub struct AddInput {
     pub steam: Option<u32>,
     pub filter: Option<String>,
     pub route: Option<String>,
+    pub links: Vec<String>,
     pub allow_cidrs: Vec<String>,
     pub deny_cidrs: Vec<String>,
     pub except_cidrs: Vec<String>,
@@ -113,20 +116,23 @@ pub fn build_target(input: &AddInput) -> Result<TargetSpec, String> {
 pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
     validate_name(&input.name)?;
     let target = build_target(&input)?;
-    let mode = validate_mode(ModeInput {
-        filter: input.filter.as_deref(),
-        route: input.route.as_deref(),
-        allow_cidrs: &input.allow_cidrs,
-        deny_cidrs: &input.deny_cidrs,
-        except_cidrs: &input.except_cidrs,
-        gateway: input.gateway.as_deref(),
-        gateway6: input.gateway6.as_deref(),
-        include_lan: input.include_lan,
-        allow_ipv6: input.allow_ipv6,
-        udp_only: input.udp_only,
-        except_ports: &input.except_ports,
-        except_sports: &input.except_sports,
-    })?;
+    let mode = validate_mode_links(
+        ModeInput {
+            filter: input.filter.as_deref(),
+            route: input.route.as_deref(),
+            allow_cidrs: &input.allow_cidrs,
+            deny_cidrs: &input.deny_cidrs,
+            except_cidrs: &input.except_cidrs,
+            gateway: input.gateway.as_deref(),
+            gateway6: input.gateway6.as_deref(),
+            include_lan: input.include_lan,
+            allow_ipv6: input.allow_ipv6,
+            udp_only: input.udp_only,
+            except_ports: &input.except_ports,
+            except_sports: &input.except_sports,
+        },
+        &input.links,
+    )?;
     Ok(AddProfile {
         name: input.name,
         target,
@@ -136,9 +142,45 @@ pub fn build_add(input: AddInput) -> Result<AddProfile, String> {
 }
 
 pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
+    validate_mode_links(input, &[])
+}
+
+pub fn validate_mode_links(input: ModeInput<'_>, links: &[String]) -> Result<ModeSpec, String> {
+    if !links.is_empty() && (input.filter.is_some() || input.route.is_some()) {
+        return Err("--link conflicts with --filter and --route".to_string());
+    }
+    if links.is_empty() {
+        return validate_mode_classic(input);
+    }
+    if input.gateway.is_some() || input.gateway6.is_some() {
+        return Err("--gateway and --gateway6 belong inside --link iface@gateway".to_string());
+    }
+    if !input.allow_cidrs.is_empty() || !input.deny_cidrs.is_empty() {
+        return Err("--allow-cidr and --deny-cidr are only valid with --filter".to_string());
+    }
+    let parsed = parse_links(links, input.allow_ipv6)?;
+    let primary = &parsed[0];
+    let (except_ports, except_sports) =
+        validate_route_ports(input.udp_only, input.except_ports, input.except_sports)?;
+    validate_cidrs(input.except_cidrs)?;
+    Ok(ModeSpec::Route {
+        interface: primary.interface.clone(),
+        gateway: primary.gateway.clone(),
+        gateway6: primary.gateway6.clone(),
+        links: parsed,
+        include_lan: input.include_lan,
+        allow_ipv6: input.allow_ipv6,
+        udp_only: input.udp_only,
+        except_ports,
+        except_sports,
+        except: input.except_cidrs.to_vec(),
+    })
+}
+
+fn validate_mode_classic(input: ModeInput<'_>) -> Result<ModeSpec, String> {
     match (input.filter, input.route) {
         (Some(_), Some(_)) => Err("--filter and --route are mutually exclusive".to_string()),
-        (None, None) => Err("exactly one of --filter or --route is required".to_string()),
+        (None, None) => Err("exactly one of --filter, --route, or --link is required".to_string()),
         (Some(filter), None) => {
             if input.gateway.is_some()
                 || input.gateway6.is_some()
@@ -211,34 +253,18 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
                 }
             }
             validate_cidrs(input.except_cidrs)?;
-            if !input.udp_only && !input.except_ports.is_empty() {
-                return Err("--except-port requires --udp".to_string());
-            }
-            if input.except_ports.len() > 32 {
-                return Err("--except-port accepts at most 32 ports".to_string());
-            }
-            let mut except_ports = input.except_ports.to_vec();
-            except_ports.sort_unstable();
-            except_ports.dedup();
-            if except_ports.contains(&0) {
-                return Err("--except-port must be 1..=65535".to_string());
-            }
-            if !input.udp_only && !input.except_sports.is_empty() {
-                return Err("--except-sport requires --udp".to_string());
-            }
-            if input.except_sports.len() > 64 {
-                return Err("--except-sport accepts at most 64 ports".to_string());
-            }
-            let mut except_sports = input.except_sports.to_vec();
-            except_sports.sort_unstable();
-            except_sports.dedup();
-            if except_sports.contains(&0) {
-                return Err("--except-sport must be 1..=65535".to_string());
-            }
-            Ok(ModeSpec::Route {
+            let (except_ports, except_sports) =
+                validate_route_ports(input.udp_only, input.except_ports, input.except_sports)?;
+            let link = RouteLink {
                 interface: interface.to_string(),
                 gateway: input.gateway.map(str::to_string),
                 gateway6: input.gateway6.map(str::to_string),
+            };
+            Ok(ModeSpec::Route {
+                interface: link.interface.clone(),
+                gateway: link.gateway.clone(),
+                gateway6: link.gateway6.clone(),
+                links: vec![link],
                 include_lan: input.include_lan,
                 allow_ipv6: input.allow_ipv6,
                 udp_only: input.udp_only,
@@ -248,6 +274,102 @@ pub fn validate_mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
             })
         }
     }
+}
+
+fn validate_route_ports(
+    udp_only: bool,
+    ports: &[u16],
+    sports: &[u16],
+) -> Result<(Vec<u16>, Vec<u16>), String> {
+    if !udp_only && !ports.is_empty() {
+        return Err("--except-port requires --udp".to_string());
+    }
+    if ports.len() > 32 {
+        return Err("--except-port accepts at most 32 ports".to_string());
+    }
+    let mut except_ports = ports.to_vec();
+    except_ports.sort_unstable();
+    except_ports.dedup();
+    if except_ports.contains(&0) {
+        return Err("--except-port must be 1..=65535".to_string());
+    }
+    if !udp_only && !sports.is_empty() {
+        return Err("--except-sport requires --udp".to_string());
+    }
+    if sports.len() > 64 {
+        return Err("--except-sport accepts at most 64 ports".to_string());
+    }
+    let mut except_sports = sports.to_vec();
+    except_sports.sort_unstable();
+    except_sports.dedup();
+    if except_sports.contains(&0) {
+        return Err("--except-sport must be 1..=65535".to_string());
+    }
+    Ok((except_ports, except_sports))
+}
+
+/// Parse `iface`, `iface@ipv4`, `iface#ipv6`, or `iface@ipv4#ipv6`.
+pub fn parse_link(text: &str) -> Result<RouteLink, String> {
+    // The IPv6 half may stand alone (`iface#v6`), so split it before `@`.
+    let (left, gateway6) = text
+        .split_once('#')
+        .map_or((text, None), |(left, gateway6)| (left, non_empty(gateway6)));
+    let (interface, gateway) = left
+        .split_once('@')
+        .map_or((left, None), |(interface, gateway)| {
+            (interface, non_empty(gateway))
+        });
+    if interface.is_empty()
+        || interface.chars().any(|character| {
+            character.is_whitespace() || character == '/' || character == '@' || character == '#'
+        })
+    {
+        return Err(format!(
+            "invalid --link '{text}': expected <iface>[@<ipv4>][#<ipv6>]"
+        ));
+    }
+    if let Some(gateway) = &gateway {
+        if !ipv4_valid(gateway) {
+            return Err(format!("invalid IPv4 gateway '{gateway}' in --link {text}"));
+        }
+    }
+    if let Some(gateway6) = &gateway6 {
+        if !ipv6_valid(gateway6) {
+            return Err(format!(
+                "invalid IPv6 gateway '{gateway6}' in --link {text}"
+            ));
+        }
+    }
+    Ok(RouteLink {
+        interface: interface.to_string(),
+        gateway,
+        gateway6,
+    })
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn parse_links(links: &[String], allow_ipv6: bool) -> Result<Vec<RouteLink>, String> {
+    if links.len() > 8 {
+        return Err("--link accepts at most 8 interfaces".to_string());
+    }
+    let mut parsed: Vec<RouteLink> = Vec::with_capacity(links.len());
+    for text in links {
+        let link = parse_link(text)?;
+        if parsed
+            .iter()
+            .any(|existing| existing.interface == link.interface)
+        {
+            return Err(format!("duplicate --link interface {}", link.interface));
+        }
+        if link.gateway6.is_some() && !allow_ipv6 {
+            return Err("an IPv6 --link gateway requires --allow-ipv6".to_string());
+        }
+        parsed.push(link);
+    }
+    Ok(parsed)
 }
 
 fn validate_cidrs(cidrs: &[String]) -> Result<(), String> {
@@ -620,6 +742,41 @@ fn print_profiles(profiles: &[ProfileStatus]) {
             profile.consumers.join(","),
             profile.policies.join(",")
         );
+        let interface_width = profile
+            .links
+            .iter()
+            .map(|link| link.interface.len())
+            .max()
+            .unwrap_or(0);
+        let gateway_width = profile
+            .links
+            .iter()
+            .map(|link| {
+                link.gateway
+                    .as_deref()
+                    .or(link.gateway6.as_deref())
+                    .map_or(1, str::len)
+            })
+            .max()
+            .unwrap_or(1);
+        for link in &profile.links {
+            let gateway = link
+                .gateway
+                .as_deref()
+                .or(link.gateway6.as_deref())
+                .unwrap_or("-");
+            let rtt = link
+                .rtt_ms
+                .map_or_else(|| "-".to_string(), |rtt| format!("{rtt}ms"));
+            println!(
+                "  link {:<interface_width$}  {:<gateway_width$}  {:<4}  {:<5}  {}",
+                link.interface,
+                gateway,
+                link.phase,
+                rtt,
+                if link.active { "active" } else { "-" }
+            );
+        }
     }
 }
 
@@ -944,5 +1101,116 @@ mod tests {
         assert!(validate_name("Game").is_err());
         assert!(validate_name("-game").is_err());
         assert!(validate_name("").is_err());
+    }
+
+    fn link_mode(allow_ipv6: bool) -> ModeInput<'static> {
+        ModeInput {
+            filter: None,
+            route: None,
+            allow_cidrs: &[],
+            deny_cidrs: &[],
+            except_cidrs: &[],
+            gateway: None,
+            gateway6: None,
+            include_lan: false,
+            allow_ipv6,
+            udp_only: false,
+            except_ports: &[],
+            except_sports: &[],
+        }
+    }
+
+    #[test]
+    fn link_grammar_accepts_the_documented_forms() {
+        let bare = parse_link("enp7s0f4u1").expect("bare interface");
+        assert_eq!(bare.interface, "enp7s0f4u1");
+        assert_eq!(bare.gateway, None);
+        assert_eq!(bare.gateway6, None);
+
+        let v4 = parse_link("enp7s0f4u1@10.0.0.1").expect("ipv4 gateway");
+        assert_eq!(v4.interface, "enp7s0f4u1");
+        assert_eq!(v4.gateway.as_deref(), Some("10.0.0.1"));
+        assert_eq!(v4.gateway6, None);
+
+        let dual = parse_link("enp7s0f4u1@10.0.0.1#2001:db8::1").expect("both gateways");
+        assert_eq!(dual.gateway.as_deref(), Some("10.0.0.1"));
+        assert_eq!(dual.gateway6.as_deref(), Some("2001:db8::1"));
+    }
+
+    #[test]
+    fn link_grammar_rejects_bad_forms() {
+        for text in [
+            "",
+            "@10.0.0.1",
+            "eth 0",
+            "eth/0",
+            "eth0@not-an-ip",
+            "eth0@10.0.0.1#not-an-ip",
+        ] {
+            assert!(parse_link(text).is_err(), "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn link_list_rejects_duplicates_and_more_than_eight() {
+        let duplicate = vec!["eth0".to_string(), "eth0@10.0.0.1".to_string()];
+        let error = validate_mode_links(link_mode(false), &duplicate).expect_err("duplicate");
+        assert!(error.contains("duplicate"), "{error}");
+
+        let nine: Vec<String> = (0..9).map(|index| format!("eth{index}")).collect();
+        let error = validate_mode_links(link_mode(false), &nine).expect_err("nine links");
+        assert!(error.contains("at most 8"), "{error}");
+    }
+
+    #[test]
+    fn ipv6_link_gateway_requires_allow_ipv6() {
+        let links = vec!["eth0#2001:db8::1".to_string()];
+        let error = validate_mode_links(link_mode(false), &links).expect_err("v6 without allow");
+        assert!(error.contains("--allow-ipv6"), "{error}");
+        assert!(validate_mode_links(link_mode(true), &links).is_ok());
+    }
+
+    #[test]
+    fn link_conflicts_with_route_and_gateway() {
+        let links = vec!["eth0".to_string()];
+        let error = validate_mode_links(
+            ModeInput {
+                route: Some("tun0"),
+                ..link_mode(false)
+            },
+            &links,
+        )
+        .expect_err("route and link conflict");
+        assert!(error.contains("conflicts"), "{error}");
+
+        let error = validate_mode_links(
+            ModeInput {
+                gateway: Some("10.0.0.1"),
+                ..link_mode(false)
+            },
+            &links,
+        )
+        .expect_err("gateway outside link");
+        assert!(error.contains("belong inside --link"), "{error}");
+    }
+
+    #[test]
+    fn first_link_mirrors_into_the_primary_fields() {
+        let links = vec!["eth0@10.0.0.1".to_string(), "eth1@10.0.1.1".to_string()];
+        let spec = validate_mode_links(link_mode(false), &links).expect("two links");
+        match spec {
+            ModeSpec::Route {
+                interface,
+                gateway,
+                links,
+                ..
+            } => {
+                assert_eq!(interface, "eth0");
+                assert_eq!(gateway.as_deref(), Some("10.0.0.1"));
+                assert_eq!(links.len(), 2);
+                assert_eq!(links[1].interface, "eth1");
+            }
+            other => panic!("expected route, got {other:?}"),
+        }
     }
 }
