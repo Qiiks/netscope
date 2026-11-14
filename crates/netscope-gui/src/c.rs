@@ -558,7 +558,7 @@ fn links_unavailable(k: &Kit) -> El {
                 ))
                 .child(ui::faint(
                     k,
-                    "The 0.2.1 status document has no link telemetry; values appear after 0.3.",
+                    "This daemon's status document carries no link telemetry.",
                 )),
         )
 }
@@ -1479,7 +1479,7 @@ fn policy_panel_add(s: &State, k: &Kit) -> El {
                 } else {
                     ui::faint(
                         k,
-                        "This 0.2.1 daemon enforces the first link; the rest are kept in the window.",
+                        "Failover order: first healthy link carries the default route.",
                     )
                 });
         }
