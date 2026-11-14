@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=netscope
+Comment=Inspect the netscope daemon
+Exec=netscope-gui
+Icon=netscope-gui
+Terminal=false
+Categories=System;Monitor;
+Keywords=network;scopes;routing;
+StartupWMClass=netscope-gui

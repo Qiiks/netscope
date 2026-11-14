@@ -1,0 +1,26 @@
+[package]
+name = "netscope-gui"
+version.workspace = true
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+description = "Desktop inspector for the netscope daemon"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "netscope-gui"
+path = "src/main.rs"
+
+[dependencies]
+netscope-client = { version = "0.2.1", path = "../netscope-client" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04" }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
