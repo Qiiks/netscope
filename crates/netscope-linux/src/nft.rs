@@ -290,6 +290,12 @@ fn render_table(kind: &str, priority: &str, selectors: &[String; 2], rules: &[St
         "  chain output {{\n    type {kind} hook output priority {priority}; policy accept;"
     )
     .expect("writing to a String cannot fail");
+    // Loopback must not inflate bandwidth counters; dispatch already accepts
+    // it explicitly for outbound, so exclude it here before the selectors.
+    body.push_str(
+        "    meta nfproto ipv4 ip daddr 127.0.0.0/8 accept\n\
+         \x20   meta nfproto ipv6 ip6 daddr ::1/128 accept\n",
+    );
     for (selector, counter) in selectors.iter().zip(["seen_cg", "seen_mk"]) {
         writeln!(body, "    {selector} counter name {counter} goto dispatch")
             .expect("writing to a String cannot fail");
@@ -300,6 +306,12 @@ fn render_table(kind: &str, priority: &str, selectors: &[String; 2], rules: &[St
     }
     body.push_str(
         "  }\n  chain input {\n    type filter hook input priority filter; policy accept;\n",
+    );
+    // Loopback must not inflate bandwidth counters; dispatch already accepts
+    // it explicitly for outbound, so exclude it here before the selectors.
+    body.push_str(
+        "    meta nfproto ipv4 ip saddr 127.0.0.0/8 accept\n\
+         \x20   meta nfproto ipv6 ip6 saddr ::1/128 accept\n",
     );
     for (selector, counter) in selectors.iter().zip(["rx_cg", "rx_mk"]) {
         writeln!(body, "    {selector} counter name {counter} goto rx_sink")

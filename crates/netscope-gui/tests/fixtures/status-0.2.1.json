@@ -1,0 +1,36 @@
+{
+  "api_version": 2,
+  "cgroup_root": "/sys/fs/cgroup/netscope",
+  "config_path": "/etc/netscope/config.toml",
+  "daemon_version": "0.2.1",
+  "kernel": "7.3.3-1-cachyos",
+  "pid": 585077,
+  "profiles": [
+    {
+      "attached": "none",
+      "cgroup": "/sys/fs/cgroup/netscope/dropship-overwatch",
+      "cgroup_level": 2,
+      "consumers": [
+        "dropship"
+      ],
+      "enabled": true,
+      "generation": 180758,
+      "healthy": true,
+      "id": "dropship-overwatch",
+      "mark": "0x4e53",
+      "mode": "filter",
+      "nft_table": "inet netscope_dropship_overwatch",
+      "pids": [],
+      "policies": [
+        "dropship:filter"
+      ],
+      "rule_priority": 1000,
+      "table": 20000,
+      "target": "name:Overwatch.exe",
+      "warnings": [
+        "name target: running processes attach late; new launches attach pre-exec"
+      ]
+    }
+  ],
+  "state_path": "/var/lib/netscope/state.json"
+}

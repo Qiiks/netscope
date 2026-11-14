@@ -147,9 +147,15 @@ pub fn set_default(profile: &Profile, winner: Option<&RouteLink>) -> Result<(), 
     };
     match winner {
         Some(link) => {
-            install_default(profile, 4, link)?;
+            if let Err(err) = install_default(profile, 4, link) {
+                let _ = delete_default(4, profile.table);
+                return Err(err);
+            }
             if *allow_ipv6 {
-                install_default(profile, 6, link)?;
+                if let Err(err) = install_default(profile, 6, link) {
+                    let _ = delete_default(6, profile.table);
+                    return Err(err);
+                }
             }
         }
         None => {

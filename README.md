@@ -63,6 +63,22 @@ sudo netscope --uid "$(id -u)" open --consumer dropship --process Overwatch.exe 
 Both consumers get the same profile and cgroup. Each owns its own policy; the
 last `netscope close` removes the scope. See [shared scopes](docs/src/shared-scopes.md).
 
+## Desktop GUI
+
+`netscope-gui` is a calm desktop inspector for the daemon: overview rates and links, scopes with
+their claims and permissions, an Add scope flow, and a Doctor screen whose fix commands copy to
+the clipboard. It opens peer holds by default, so closing the window releases them.
+
+```sh
+cargo build --release -p netscope-gui
+./target/release/netscope-gui
+```
+
+The window reports a down daemon, retries every two seconds, and shows the exact
+`systemctl start netscoped` or `usermod -aG netscope` hint. `--demo` and headless `--snap`
+scenes exist for screenshots; normal launches never read demonstration data. See
+[the GUI documentation](docs/src/gui.md).
+
 ## Developer SDK & Protocol
 
 Two programs can share one process through the [`netscope-client`](https://crates.io/crates/netscope-client)
