@@ -5,6 +5,7 @@ members = [
     "crates/netscope-daemon",
     "crates/netscope-cli",
     "crates/netscope-client",
+    "crates/netscope-gui",
 ]
 
 [workspace.package]

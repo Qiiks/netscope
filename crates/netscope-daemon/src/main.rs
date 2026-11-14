@@ -1326,8 +1326,13 @@ fn expected_link(inner: &Inner, profile: &Profile) -> Option<RouteLink> {
 /// configured link here would undo a failover on the next tick.
 fn link_expectation(monitor: Option<&LinkMonitor>, links: &[RouteLink]) -> Option<RouteLink> {
     match monitor {
-        Some(monitor) => monitor.winner().cloned(),
-        None => links.first().cloned(),
+        Some(monitor)
+            if monitor.links().count() == links.len()
+                && monitor.links().zip(links.iter()).all(|(a, b)| a == b) =>
+        {
+            monitor.winner().cloned()
+        }
+        _ => links.first().cloned(),
     }
 }
 
@@ -1519,11 +1524,13 @@ async fn stats_task(rt: Arc<Rt>) {
             .collect();
         for (id, table) in tables {
             if let Some(snapshot) = counters.get(&table) {
-                inner
-                    .stats
-                    .entry(id)
-                    .or_default()
-                    .sample(*snapshot, elapsed);
+                // On first observation adopt the current counter as the
+                // baseline so pre-restart traffic is not reported as new.
+                let state = inner.stats.entry(id).or_insert_with(|| StatsState {
+                    last: *snapshot,
+                    ..Default::default()
+                });
+                state.sample(*snapshot, elapsed);
             }
         }
     }
@@ -1616,6 +1623,11 @@ async fn link_task(rt: Arc<Rt>) {
             let Some(profile) = inner.state.profiles.get(&id).cloned() else {
                 continue;
             };
+            // The profile may have been disabled or lost its route while
+            // probes were in flight; don't resurrect routes for it.
+            if !profile.enabled || !profile.has_route() {
+                continue;
+            }
             let links_now = profile.route_links();
             let unchanged = inner.links.get(&id).is_some_and(|monitor| {
                 monitor.entries.len() == links_now.len()
@@ -1637,7 +1649,13 @@ async fn link_task(rt: Arc<Rt>) {
                 continue;
             };
             let before = monitor.active;
-            let winner = monitor.step(&outcomes, now);
+            // After a rebuild the monitor is fresh (optimistic on the new
+            // primary); the old outcomes belong to the old link list.
+            let winner = if rebuilt {
+                monitor.active
+            } else {
+                monitor.step(&outcomes, now)
+            };
             if !rebuilt && before == winner {
                 continue;
             }
@@ -2675,6 +2693,7 @@ fn teardown_profile(rt: &Rt, inner: &mut Inner, profile: &Profile) {
     inner.state.profiles.remove(&profile.id);
     inner.health.remove(&profile.id);
     inner.stats.remove(&profile.id);
+    inner.links.remove(&profile.id);
     remove_loader_marks(rt, inner, profile);
 }
 
@@ -2841,6 +2860,9 @@ fn profile_status(rt: &Rt, inner: &Inner, profile: &Profile) -> ProfileStatus {
 /// Before the first probe, report the configured links optimistically with
 /// the primary active; the monitor then replaces this view.
 fn link_statuses(inner: &Inner, profile: &Profile) -> Vec<LinkStatus> {
+    if !profile.has_route() {
+        return Vec::new();
+    }
     if let Some(monitor) = inner.links.get(&profile.id) {
         return monitor.statuses();
     }
@@ -3115,6 +3137,7 @@ async fn remove_profile(rt: &Arc<Rt>, peer_uid: u32, id: &str) -> Result<(), Str
     inner.marked.remove(id);
     inner.state.profiles.remove(id);
     inner.health.remove(id);
+    inner.links.remove(id);
     remove_loader_marks(rt, &inner, &profile);
     save_state(&rt.cfg.daemon.state_path, &inner.state)
         .map_err(|err| format!("state: write failed: {err}"))?;
@@ -3359,8 +3382,23 @@ fn normalize_links(
             gateway6: gateway6.clone(),
         }]
     } else {
-        if gateway.is_some() || gateway6.is_some() {
-            return Err("gateway belongs to a link; use --link iface@gateway".to_string());
+        // The CLI mirrors the primary link's gateway into the legacy
+        // `gateway`/`gateway6` fields for backwards compatibility with
+        // single-link profiles. When `links` is non-empty, these mirrors
+        // are redundant, not a conflict.
+        if gateway.is_some() && gateway != &links[0].gateway {
+            return Err(format!(
+                "--gateway conflicts with --link (expected {}, got {})",
+                links[0].gateway.as_deref().unwrap_or("<none>"),
+                gateway.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if gateway6.is_some() && gateway6 != &links[0].gateway6 {
+            return Err(format!(
+                "--gateway6 conflicts with --link (expected {}, got {})",
+                links[0].gateway6.as_deref().unwrap_or("<none>"),
+                gateway6.as_deref().unwrap_or("<none>")
+            ));
         }
         links.to_vec()
     };

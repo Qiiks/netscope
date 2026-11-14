@@ -27,9 +27,30 @@
   (`↓ 3.2 MB/s ↑ 420 kB/s`, `—` when the profile has no table).
 - `netscope-client` re-exports `ProfileStats` and adds typed `enable`,
   `disable`, and `remove` helpers.
+- `netscope-gui`, a desktop inspector for `netscoped`: overview with live
+  rates and per-link RTT, scopes, add/enable/disable/remove, doctor, tray,
+  pause, demo data, and headless `--snap` rendering. It maps the daemon's
+  `links` and `stats` into the same view the CLI reports.
 
 ### Fixed
 
+- A probe for a link with a configured gateway installs a host route
+  (`/32` or `/128`) for the probe target through that gateway. Without it,
+  binding the probe to the interface made an off-link target resolve as
+  on-link, ARP failed, and a healthy link was reported permanently down.
+- A failover switch deletes the previous winner's IPv6 default before
+  installing the new one, so a v6-incapable winner cannot leak IPv6 through
+  the stale route. With `--allow-ipv6`, IPv6 from a v6-incapable winner
+  matches the blackhole instead of moving to another link.
+- Loopback is accepted before the bandwidth counters on both hooks, so local
+  traffic no longer inflates `tx_bytes`, `rx_bytes`, or the reported rates.
+- The stats sampler adopts the current kernel counters as a baseline on first
+  observation, so a daemon restart does not report traffic from before the
+  restart as new.
+- A policy that carries a `links` array plus the legacy primary
+  `gateway`/`gateway6` mirrors is accepted when the values agree, instead of
+  rejecting the mirror as a conflict. `--route <iface> --gateway <ipv4>`
+  remains a single-link profile, equivalent to `--link <iface>@<ipv4>`.
 - `netscoped.service` keeps `CAP_CHOWN` so the control socket is handed to
   group `netscope`; without it every unprivileged client was denied.
 - The health reconciler follows the link monitor's current winner instead of

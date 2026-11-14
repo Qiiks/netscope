@@ -6,7 +6,8 @@ usage() {
 usage: install.sh [--dry-run]
 
 Install netscope binaries, the systemd unit, the sysusers entry, and the
-default configuration. Existing /etc/netscope/config.toml and
+default configuration. netscope-gui and its desktop entry are installed
+when present in this directory. Existing /etc/netscope/config.toml and
 /var/lib/netscope/state.json are preserved.
 
   --dry-run   print every action without changing the system
@@ -67,8 +68,11 @@ sysusers_file=$(pick "$here/netscope.sysusers" "$here/packaging/netscope.sysuser
     || fail "netscope.sysusers not found"
 config_file=$(pick "$here/config.toml" "$here/packaging/config.toml") \
     || fail "config.toml not found"
+gui_bin=$(pick "$here/netscope-gui" "$here/target/release/netscope-gui" "$here/target/debug/netscope-gui") || gui_bin=
+gui_desktop=$(pick "$here/netscope-gui.desktop" "$here/packaging/netscope-gui.desktop") || gui_desktop=
+gui_icon=$(pick "$here/netscope-gui.png" "$here/packaging/icons/netscope-gui.png") || gui_icon=
 
-[ "$(uname -m)" = "x86_64" ] || fail "unsupported architecture $(uname -m); netscope v0.2.1 ships x86_64 only"
+[ "$(uname -m)" = "x86_64" ] || fail "unsupported architecture $(uname -m); netscope ships x86_64 only"
 
 kernel=$(uname -r)
 kernel_release=${kernel%%-*}
@@ -96,6 +100,24 @@ if [ -e /etc/netscope/config.toml ]; then
     echo "preserved /etc/netscope/config.toml"
 else
     run install -Dm644 "$config_file" /etc/netscope/config.toml
+fi
+
+if [ -n "$gui_bin" ]; then
+    run install -Dm755 "$gui_bin" /usr/bin/netscope-gui
+    if [ -n "$gui_desktop" ] && [ -n "$gui_icon" ]; then
+        run install -Dm644 "$gui_desktop" /usr/share/applications/netscope-gui.desktop
+        run install -Dm644 "$gui_icon" /usr/share/icons/hicolor/256x256/apps/netscope-gui.png
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            run_ignore update-desktop-database /usr/share/applications
+        fi
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            run_ignore gtk-update-icon-cache -f -t /usr/share/icons/hicolor
+        fi
+    else
+        echo "netscope-gui.desktop/netscope-gui.png not found; skipped desktop integration"
+    fi
+else
+    echo "netscope-gui not found; installed the daemon and CLI only"
 fi
 
 run systemctl enable netscoped.service

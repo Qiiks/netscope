@@ -65,8 +65,9 @@ pub enum ProbeOutcome {
 impl ProbeOutcome {
     /// A completed probe with its measured latency.
     pub fn success(elapsed: Duration) -> Self {
+        let millis = u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX);
         Self::Up {
-            rtt_ms: Some(elapsed.as_millis().try_into().unwrap_or(u32::MAX)),
+            rtt_ms: Some(millis),
         }
     }
 
@@ -205,13 +206,54 @@ impl LinkMonitor {
 /// `config.target6` is set only when the profile allows IPv6, so a v6-only
 /// link is probed over v6 exactly when that family may carry traffic.
 pub fn probe(link: &RouteLink, config: &ProbeConfig) -> ProbeOutcome {
+    // A link with a configured gateway needs a probe route through it;
+    // SO_BINDTODEVICE alone resolves the off-link target as on-link.
+    if let (Some(gateway), true) = (&link.gateway, config.target.is_ipv4()) {
+        ensure_probe_route(link, gateway, &config.target);
+    }
+    if let (Some(gateway6), Some(target6)) = (&link.gateway6, config.target6) {
+        if target6.is_ipv6() {
+            ensure_probe_route(link, gateway6, &target6);
+        }
+    }
     if let Some(source) = source_address(&link.interface, 4) {
         return tcp_probe(&link.interface, source, config.target);
     }
     if let (Some(source), Some(target)) = (source_address(&link.interface, 6), config.target6) {
         return tcp_probe(&link.interface, source, target);
     }
-    ping_probe(&link.interface, config.target)
+    // No source address: probe the gateway directly as a reachability signal.
+    if let Some(gateway) = &link.gateway {
+        return ping_probe(&link.interface, gateway);
+    }
+    ping_probe(&link.interface, &config.target.ip().to_string())
+}
+
+/// Install a host-scoped route for the probe target through a link's gateway.
+/// Without this, an off-link probe target resolves as on-link when
+/// SO_BINDTODEVICE forces the egress device, so ARP fails and the link
+/// appears permanently down even when it is healthy.
+fn ensure_probe_route(link: &RouteLink, gateway: &str, target: &SocketAddr) {
+    let (family, prefix) = if target.is_ipv4() {
+        ("-4", 32)
+    } else {
+        ("-6", 128)
+    };
+    let host = format!("{}/{prefix}", target.ip());
+    let _ = command::run(
+        "ip",
+        &[
+            family,
+            "route",
+            "replace",
+            &host,
+            "via",
+            gateway,
+            "dev",
+            &link.interface,
+        ],
+        None,
+    );
 }
 
 /// First global address of the requested family on the interface.
@@ -258,13 +300,12 @@ fn tcp_probe(interface: &str, source: IpAddr, target: SocketAddr) -> ProbeOutcom
     }
 }
 
-fn ping_probe(interface: &str, target: SocketAddr) -> ProbeOutcome {
-    let flag = if target.is_ipv6() { "-6" } else { "-4" };
-    let host = target.ip().to_string();
+fn ping_probe(interface: &str, host: &str) -> ProbeOutcome {
+    let flag = if host.contains(':') { "-6" } else { "-4" };
     let started = Instant::now();
     match command::run(
         "ping",
-        &[flag, "-I", interface, "-c", "1", "-W", "1", &host],
+        &[flag, "-I", interface, "-c", "1", "-W", "1", host],
         None,
     ) {
         Ok(_) => ProbeOutcome::success(started.elapsed()),

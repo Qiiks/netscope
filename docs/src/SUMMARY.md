@@ -11,6 +11,7 @@
 - [Route mode](modes/route.md)
 - [Configuration](configuration.md)
 - [CLI reference](cli.md)
+- [Desktop GUI](gui.md)
 - [Security](security.md)
 - [Troubleshooting](troubleshooting.md)
 - [Support bundle](support-bundle.md)
