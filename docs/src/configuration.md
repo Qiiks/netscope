@@ -70,14 +70,22 @@ counters for routed and dropped traffic. The daemon samples them once per
 second with a single `nft -j list ruleset` call and keeps the totals and
 smoothed rates in memory; `status` and `list` only read that cache.
 
-- Totals cover the running daemon, from `since_unix` (daemon start).
+- Totals are a counter window that starts at `since_unix`, the daemon's start
+  time; every profile reports the same value. A daemon restart starts a new
+  window, and the first sample after it adopts the kernel counters as a
+  baseline, so traffic written before the restart is not reported as new.
+- Loopback is accepted before the counter selectors in both directions:
+  outbound `127.0.0.0/8` and `::1/128` destinations, inbound the same source
+  ranges. Local traffic therefore never inflates `tx_bytes`, `rx_bytes`, or
+  the `TRAFFIC` rates.
 - Recreating a table resets its kernel counters. The daemon treats the new
   value as the next delta, so reported totals never move backwards; rates can
   dip for a sample.
 - Disabling a profile removes its table, so `stats` becomes `null`; enabling
   it installs a fresh table that counts from zero while the daemon's totals
   keep their previous value plus the new traffic.
-- Nothing is persisted. A daemon restart starts a new window at zero.
+- Nothing is persisted; the totals and rates live in memory for the daemon's
+  lifetime.
 
 ## Limits
 

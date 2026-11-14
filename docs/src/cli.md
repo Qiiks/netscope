@@ -94,9 +94,9 @@ Creates a profile. Exactly one of `--exe`, `--wine`, `--process`, and `--steam` 
 | `--allow-cidr <cidr>` | `--filter drop` | Destination to keep reachable. Repeatable. |
 | `--deny-cidr <cidr>` | `--filter allow` | Destination to drop. Repeatable; at least one is required. |
 | `--route <iface>` | Route profiles | Tunnel interface. |
-| `--link <spec>` | Route profiles | Ordered link: `<iface>`, `<iface>@<ipv4>`, `<iface>#<ipv6>`, or `<iface>@<ipv4>#<ipv6>`. Repeatable, up to 8; the first healthy link carries the default route. Conflicts with `--route`. |
-| `--gateway <ipv4>` | `--route` | IPv4 next hop. |
-| `--gateway6 <ipv6>` | `--route --allow-ipv6` | IPv6 next hop. |
+| `--link <spec>` | Route profiles | Ordered link: `<iface>`, `<iface>@<ipv4>`, `<iface>#<ipv6>`, or `<iface>@<ipv4>#<ipv6>`. Repeatable, up to 8; the first healthy link carries the default route. The canonical place for a per-link gateway. Conflicts with `--route`. |
+| `--gateway <ipv4>` | `--route` | IPv4 next hop. Legacy single-link form of `--link <iface>@<ipv4>`. |
+| `--gateway6 <ipv6>` | `--route --allow-ipv6` | IPv6 next hop. Legacy single-link form of `--link <iface>#<ipv6>`. |
 | `--include-lan` | `--route` | Route LAN destinations instead of bypassing them. |
 | `--allow-ipv6` | `--route` | Carry IPv6; without it, IPv6 is dropped. |
 | `--udp` | `--route` | Mark only IPv4 UDP; TCP keeps its normal route. |
@@ -120,6 +120,13 @@ Rules enforced before the daemon is asked:
 - `--except-port` requires `--udp` and takes 32 ports; port `0` is rejected.
 - `--except-sport` requires `--udp` and takes 64 ports; port `0` is rejected. Pinned sockets are never marked and their packets are accepted before the mark rule, so a flow that already existed when the profile opened keeps its normal route. A socket keeps its source port for its whole life, so the pin holds until the process exits.
 - `--except` takes up to 30 CIDRs. The daemon installs each as an `ip rule` to `main` at a lower priority than the mark rule.
+
+A gateway inside the link spec is the canonical form. `--route eth0 --gateway
+192.168.1.1` (and `--gateway6` with `--allow-ipv6`) remains accepted for
+compatibility and is stored as a single link with the same interface and
+gateway fields, so it is equivalent to `--link eth0@192.168.1.1`. The two
+spellings cannot be mixed in one command: `--link` conflicts with `--route`,
+`--gateway`, and `--gateway6`.
 
 On success the daemon creates the cgroup, the nftables table, and, for route profiles, the policy rule and routes. If the app was already running and got attached late, the CLI prints:
 

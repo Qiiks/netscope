@@ -112,9 +112,21 @@ With `--allow-ipv6`, the daemon also installs an IPv6 policy rule and an IPv6 de
 
 ## Ordered links and failover
 
-`--link` replaces `--route` with an ordered list of interfaces. The profile
-gets one default route at a time, owned by the first link that is healthy, and
-the same winner is used for IPv4 and, when `--allow-ipv6` is set, IPv6.
+`--link` replaces `--route` with an ordered list of interfaces, and a gateway
+belongs inside the link spec: `--link wlan0@192.168.1.1` is the canonical form.
+The legacy `--route wlan0 --gateway 192.168.1.1` (with `--gateway6` for the
+IPv6 half) is still accepted and maps to a single-link profile with the same
+fields.
+
+The profile gets one default route at a time, owned by the first link that is
+healthy. That single winner is used for both families. A link is probed over
+IPv4 when it has an IPv4 source address, and otherwise over IPv6 when the
+profile allows IPv6, so a link can be the healthy winner while its other
+family has no path. With `--allow-ipv6`, a winner with no usable IPv6 path
+has no IPv6 tunnel default, the IPv6 blackhole matches, and IPv6 from the
+profile fails instead of moving to a lower-priority link that could carry it.
+A link switch deletes the previous winner's IPv6 default as well, so the
+stale route cannot leak IPv6 past a v6-incapable winner.
 
 ```sh
 sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch \
@@ -125,8 +137,12 @@ sudo netscope --uid "$(id -u)" open --consumer exitlink --name overwatch \
 Each link is probed every `probe_interval_ms` (`2000` by default). A probe
 binds to that interface, clears any inherited firewall mark, and opens a TCP
 connection to `probe_target` with a one-second timeout; an interface with no
-global source address is probed with ICMP through `ping -I` instead. Probe
-failure is a health signal, not a daemon error.
+global source address is probed with ICMP through `ping -I` instead. When the
+link spec carries a gateway, the probe first installs a host route for the
+probe target (`/32` for IPv4, `/128` for IPv6) through that gateway on the
+link's interface. Without it, `SO_BINDTODEVICE` makes the off-link target
+resolve as on-link, ARP fails, and a healthy link reads as down. Probe failure
+is a health signal, not a daemon error.
 
 | State | Rule |
 |---|---|
