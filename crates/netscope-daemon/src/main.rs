@@ -3382,8 +3382,23 @@ fn normalize_links(
             gateway6: gateway6.clone(),
         }]
     } else {
-        if gateway.is_some() || gateway6.is_some() {
-            return Err("gateway belongs to a link; use --link iface@gateway".to_string());
+        // The CLI mirrors the primary link's gateway into the legacy
+        // `gateway`/`gateway6` fields for backwards compatibility with
+        // single-link profiles. When `links` is non-empty, these mirrors
+        // are redundant, not a conflict.
+        if gateway.is_some() && gateway != &links[0].gateway {
+            return Err(format!(
+                "--gateway conflicts with --link (expected {}, got {})",
+                links[0].gateway.as_deref().unwrap_or("<none>"),
+                gateway.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if gateway6.is_some() && gateway6 != &links[0].gateway6 {
+            return Err(format!(
+                "--gateway6 conflicts with --link (expected {}, got {})",
+                links[0].gateway6.as_deref().unwrap_or("<none>"),
+                gateway6.as_deref().unwrap_or("<none>")
+            ));
         }
         links.to_vec()
     };
