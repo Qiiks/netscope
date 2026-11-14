@@ -19,6 +19,14 @@
   and connectable, and that each route profile keeps its rules and blackhole
   while a failover default is legitimately absent.
 - `probe_interval_ms`, `probe_target`, and `probe_target6` daemon config keys.
+- Per-profile traffic counters and live rates. Each nftables table now carries
+  named `seen_cg`/`seen_mk`, `rx_cg`/`rx_mk`, `routed`, and `dropped` counters;
+  the daemon samples them once per second, keeps monotonic totals and EWMA
+  rates, and reports them as `stats` in `status --json` and `list --json`.
+- The text `status` and `list` tables gain a `TRAFFIC` column
+  (`↓ 3.2 MB/s ↑ 420 kB/s`, `—` when the profile has no table).
+- `netscope-client` re-exports `ProfileStats` and adds typed `enable`,
+  `disable`, and `remove` helpers.
 
 ### Fixed
 

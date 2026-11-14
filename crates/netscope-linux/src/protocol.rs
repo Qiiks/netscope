@@ -134,6 +134,29 @@ pub struct StatusData {
     pub profiles: Vec<ProfileStatus>,
 }
 
+/// Traffic counters and live rates for one profile.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileStats {
+    /// Outbound bytes counted by both `seen_*` selectors.
+    pub tx_bytes: u64,
+    /// Inbound bytes counted by both `rx_*` selectors.
+    pub rx_bytes: u64,
+    /// Outbound packets counted by both `seen_*` selectors.
+    pub tx_packets: u64,
+    /// Inbound packets counted by both `rx_*` selectors.
+    pub rx_packets: u64,
+    /// Smoothed upload rate in bits per second.
+    pub tx_rate_bps: u64,
+    /// Smoothed download rate in bits per second.
+    pub rx_rate_bps: u64,
+    /// Bytes matched by a drop rule.
+    pub dropped_bytes: u64,
+    /// Packets matched by a drop rule.
+    pub dropped_packets: u64,
+    /// Daemon start, Unix seconds; totals cover this window.
+    pub since_unix: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProfileStatus {
     pub id: String,
@@ -160,4 +183,8 @@ pub struct ProfileStatus {
     /// older than 0.3.0.
     #[serde(default)]
     pub links: Vec<LinkStatus>,
+    /// Traffic counters and live rates; `None` when the profile has no table
+    /// (disabled, removed, or no policy) or the daemon predates them.
+    #[serde(default)]
+    pub stats: Option<ProfileStats>,
 }

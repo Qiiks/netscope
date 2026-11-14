@@ -62,6 +62,23 @@ The CLI accepts a hidden `--socket <path>` override. It exists for tests and for
 - A state version newer than the daemon is rejected rather than partially loaded.
 - Deleting it while the daemon is stopped removes all profile definitions. The host rules can be cleaned with `sudo netscope cleanup --all` before starting the daemon again.
 
+## Traffic counters and rates
+
+Each profile's nftables table carries six named counters: one pair for
+outbound packets that reach the profile, one pair for inbound packets, and
+counters for routed and dropped traffic. The daemon samples them once per
+second with a single `nft -j list ruleset` call and keeps the totals and
+smoothed rates in memory; `status` and `list` only read that cache.
+
+- Totals cover the running daemon, from `since_unix` (daemon start).
+- Recreating a table resets its kernel counters. The daemon treats the new
+  value as the next delta, so reported totals never move backwards; rates can
+  dip for a sample.
+- Disabling a profile removes its table, so `stats` becomes `null`; enabling
+  it installs a fresh table that counts from zero while the daemon's totals
+  keep their previous value plus the new traffic.
+- Nothing is persisted. A daemon restart starts a new window at zero.
+
 ## Limits
 
 - At most 32 profiles, regardless of `max_profiles`. Lowering `max_profiles` does not delete existing profiles, but adding beyond the limit fails.

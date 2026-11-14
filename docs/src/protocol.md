@@ -261,7 +261,19 @@ Daemon identity and the full profile list.
         "warnings": ["name target attaches late; existing sockets are marked"],
         "consumers": ["exitlink"],
         "policies": ["exitlink:route"],
-        "generation": 3
+        "generation": 3,
+        "links": [],
+        "stats": {
+          "tx_bytes": 48213,
+          "rx_bytes": 912460,
+          "tx_packets": 412,
+          "rx_packets": 808,
+          "tx_rate_bps": 33824,
+          "rx_rate_bps": 2621440,
+          "dropped_bytes": 0,
+          "dropped_packets": 0,
+          "since_unix": 1790000000
+        }
       }
     ]
   },
@@ -291,6 +303,27 @@ Daemon identity and the full profile list.
 | `policies` | Policy summaries, one per consumer: `<consumer>:filter` or `<consumer>:route`. |
 | `generation` | Incremented when a claim or policy changes; useful for change detection. |
 | `links` | Route links with probe state: `interface`, `gateway`, `gateway6`, `phase` (`up`/`down`), `healthy` (true when up), `active` (carrying the default route), `rtt_ms`, and `last_ok_unix`. Empty for filter profiles and for daemons older than 0.3.0. |
+| `stats` | Traffic counters and live rates, or `null` when the profile has no table. See [ProfileStats](#profilestats). |
+
+### ProfileStats
+
+`stats` is `null` when the profile has no nftables table (disabled, removed,
+or without a policy) and for daemons older than 0.3.0.
+
+| Field | Meaning |
+|---|---|
+| `tx_bytes` / `tx_packets` | Outbound traffic and packets counted by both selectors (`seen_cg` + `seen_mk`), totalled since `since_unix`. |
+| `rx_bytes` / `rx_packets` | Inbound traffic and packets (`rx_cg` + `rx_mk`). The input hook sees all traffic in this network namespace, including local loopback, when a selector matches it. |
+| `tx_rate_bps` / `rx_rate_bps` | Smoothed bits per second (EWMA, α = 0.3) over the last one-second sample. |
+| `dropped_bytes` / `dropped_packets` | Traffic matched by a drop rule. |
+| `since_unix` | Daemon start in Unix seconds; totals cover this daemon lifetime, not the host uptime. |
+
+The daemon samples nftables counters once per second and caches the result, so
+`status` and `list` never run `nft` themselves. Totals are monotonic: when a
+kernel counter goes backwards because the table was recreated (a policy or hook
+change, or a profile disabled and re-enabled), the new raw value is used as the
+delta and the totals keep growing. Rates decay toward zero while a profile is
+idle. Everything resets when the daemon restarts; counters are not persisted.
 
 ### `open`
 

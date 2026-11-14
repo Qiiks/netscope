@@ -13,8 +13,8 @@ use std::thread;
 use std::time::Duration;
 
 use netscope_client::{
-    Client, ClientError, CloseResult, FilterDefault, Hold, OpenScope, PolicySpec, ProfileStatus,
-    ScopeHandle, StatusData, TargetSpec,
+    Client, ClientError, CloseResult, FilterDefault, Hold, OpenScope, PolicySpec, ProfileStats,
+    ProfileStatus, ScopeHandle, StatusData, TargetSpec,
 };
 use serde_json::{json, Value};
 
@@ -168,6 +168,17 @@ fn profile_fixture() -> ProfileStatus {
         policies: vec!["filter".to_string()],
         generation: 7,
         links: Vec::new(),
+        stats: Some(ProfileStats {
+            tx_bytes: 1_024,
+            rx_bytes: 512,
+            tx_packets: 8,
+            rx_packets: 4,
+            tx_rate_bps: 4_096,
+            rx_rate_bps: 2_048,
+            dropped_bytes: 0,
+            dropped_packets: 0,
+            since_unix: 1_700_000_000,
+        }),
     }
 }
 

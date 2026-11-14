@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use netscope_linux::protocol::{
-    AddProfile, CloseResult, OpenScope, ProfileStatus, RequestOp, ScopeHandle, StatusData,
-    API_VERSION,
+    AddProfile, CloseResult, OpenScope, ProfileStats, ProfileStatus, RequestOp, ScopeHandle,
+    StatusData, API_VERSION,
 };
 use netscope_linux::types::{
     profile_id_valid, FilterDefault, ModeSpec, ProfileId, RouteLink, TargetSpec,
@@ -705,13 +705,44 @@ fn print_status(status: &StatusData) {
     print_profiles(&status.profiles);
 }
 
+/// Formats a bit rate as the byte rate a person reads in a transfer meter.
+fn humanize_bps(bps: u64) -> String {
+    let bytes = bps / 8;
+    if bytes < 1_000 {
+        return format!("{bytes} B/s");
+    }
+    if bytes < 1_000_000 {
+        return format!("{} kB/s", bytes / 1_000);
+    }
+    if bytes < 1_000_000_000 {
+        return format!("{:.1} MB/s", bytes as f64 / 1_000_000.0);
+    }
+    format!("{:.1} GB/s", bytes as f64 / 1_000_000_000.0)
+}
+
+fn traffic_cell(stats: Option<&ProfileStats>) -> String {
+    match stats {
+        Some(stats) => format!(
+            "↓ {} ↑ {}",
+            humanize_bps(stats.tx_rate_bps),
+            humanize_bps(stats.rx_rate_bps)
+        ),
+        None => "—".to_string(),
+    }
+}
+
 fn print_profiles(profiles: &[ProfileStatus]) {
+    let traffic: Vec<String> = profiles
+        .iter()
+        .map(|profile| traffic_cell(profile.stats.as_ref()))
+        .collect();
     let mut name_width = "NAME".len();
     let mut mode_width = "MODE".len();
     let mut target_width = "TARGET".len();
     let mut attached_width = "ATTACHED".len();
     let mut consumers_width = "CONSUMERS".len();
     let mut policies_width = "POLICIES".len();
+    let mut traffic_width = "TRAFFIC".len();
     for profile in profiles {
         name_width = name_width.max(profile.id.len());
         mode_width = mode_width.max(profile.mode.len());
@@ -720,11 +751,14 @@ fn print_profiles(profiles: &[ProfileStatus]) {
         consumers_width = consumers_width.max(profile.consumers.join(",").len());
         policies_width = policies_width.max(profile.policies.join(",").len());
     }
+    for cell in &traffic {
+        traffic_width = traffic_width.max(cell.chars().count());
+    }
     println!(
-        "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  PIDS",
-        "NAME", "MODE", "ENABLED", "TARGET", "ATTACHED", "CONSUMERS", "POLICIES"
+        "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  {:<traffic_width$}  PIDS",
+        "NAME", "MODE", "ENABLED", "TARGET", "ATTACHED", "CONSUMERS", "POLICIES", "TRAFFIC"
     );
-    for profile in profiles {
+    for (profile, traffic) in profiles.iter().zip(&traffic) {
         let enabled = if profile.enabled { "yes" } else { "no" };
         let pids = profile
             .pids
@@ -733,14 +767,15 @@ fn print_profiles(profiles: &[ProfileStatus]) {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  {pids}",
+            "{:<name_width$}  {:<mode_width$}  {:<7}  {:<target_width$}  {:<attached_width$}  {:<consumers_width$}  {:<policies_width$}  {:<traffic_width$}  {pids}",
             profile.id,
             profile.mode,
             enabled,
             profile.target,
             profile.attached,
             profile.consumers.join(","),
-            profile.policies.join(",")
+            profile.policies.join(","),
+            traffic
         );
         let interface_width = profile
             .links
@@ -786,6 +821,21 @@ mod tests {
 
     fn mode(input: ModeInput<'_>) -> Result<ModeSpec, String> {
         validate_mode(input)
+    }
+
+    #[test]
+    fn traffic_column_humanizes_rates_and_marks_missing_stats() {
+        assert_eq!(humanize_bps(0), "0 B/s");
+        assert_eq!(humanize_bps(8 * 420_000), "420 kB/s");
+        assert_eq!(humanize_bps(8 * 3_200_000), "3.2 MB/s");
+        assert_eq!(humanize_bps(8 * 2_500_000_000), "2.5 GB/s");
+        assert_eq!(traffic_cell(None), "—");
+        let stats = ProfileStats {
+            tx_rate_bps: 8 * 3_200_000,
+            rx_rate_bps: 8 * 420_000,
+            ..Default::default()
+        };
+        assert_eq!(traffic_cell(Some(&stats)), "↓ 3.2 MB/s ↑ 420 kB/s");
     }
 
     #[test]
