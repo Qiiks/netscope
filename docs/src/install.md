@@ -47,18 +47,18 @@ Log out and back in so the group membership applies. `paru -S netscope-bin` is e
 
 ## Release tarball
 
-Download `netscope-v0.3.0-x86_64-linux.tar.zst` from the [v0.3.0 release](https://github.com/Qiiks/netscope/releases/tag/v0.3.0). Verify it against the published checksum:
+Download `netscope-v0.3.1-x86_64-linux.tar.zst` from the [v0.3.1 release](https://github.com/Qiiks/netscope/releases/tag/v0.3.1). Verify it against the published checksum:
 
 ```sh
-curl -fsSLO https://github.com/Qiiks/netscope/releases/download/v0.3.0/SHA256SUMS
+curl -fsSLO https://github.com/Qiiks/netscope/releases/download/v0.3.1/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 Then extract and run the included installer:
 
 ```sh
-tar --zstd -xf netscope-v0.3.0-x86_64-linux.tar.zst
-cd netscope-v0.3.0-x86_64-linux
+tar --zstd -xf netscope-v0.3.1-x86_64-linux.tar.zst
+cd netscope-v0.3.1-x86_64-linux
 sudo ./install.sh
 sudo usermod -aG netscope "$USER"
 ```
@@ -89,7 +89,7 @@ sudo usermod -aG netscope "$USER"
 ## Cargo
 
 ```sh
-cargo install --git https://github.com/Qiiks/netscope --tag v0.3.0 --locked netscope-cli netscope-daemon
+cargo install --git https://github.com/Qiiks/netscope --tag v0.3.1 --locked netscope-cli netscope-daemon
 ```
 
 This installs the two binaries into `~/.cargo/bin` and nothing else. To run the service, the unit expects them at `/usr/bin`:
