@@ -29,6 +29,10 @@ pub struct ProbeConfig {
     pub target: SocketAddr,
     /// Optional IPv6 target, used only when the profile carries IPv6.
     pub target6: Option<SocketAddr>,
+    /// Probe over UDP datagrams instead of TCP. A gateway-less link whose
+    /// route carries UDP only — a tun device owned by a UDP-only router —
+    /// can never answer a TCP probe, so its health needs datagrams.
+    pub udp: bool,
 }
 
 impl Default for ProbeConfig {
@@ -42,6 +46,7 @@ impl Default for ProbeConfig {
                     .parse()
                     .expect("ipv6 probe target is valid"),
             ),
+            udp: false,
         }
     }
 }
@@ -216,6 +221,44 @@ pub fn probe(link: &RouteLink, config: &ProbeConfig) -> ProbeOutcome {
             ensure_probe_route(link, gateway6, &target6);
         }
     }
+    // A gateway-less link (tun/ptp) has no route for an off-link probe
+    // target either: SO_BINDTODEVICE pins the egress device, but the main
+    // table only carries the connected prefix, so the probe times out and
+    // the link reads permanently down even when the tunnel is healthy.
+    // Install a device-scoped host route the same way gated links get one.
+    // A dead device takes its routes with it, so no explicit cleanup is
+    // needed when the link or its tunnel disappears.
+    if link.gateway.is_none() && config.target.is_ipv4() {
+        let host = format!("{}/32", config.target.ip());
+        let _ = command::run(
+            "ip",
+            &["-4", "route", "replace", &host, "dev", &link.interface],
+            None,
+        );
+    }
+    if link.gateway6.is_none() {
+        if let Some(target6) = config.target6 {
+            if target6.is_ipv6() {
+                let host = format!("{}/128", target6.ip());
+                let _ = command::run(
+                    "ip",
+                    &["-6", "route", "replace", &host, "dev", &link.interface],
+                    None,
+                );
+            }
+        }
+    }
+    // A gateway-less link (tun/ptp) whose route carries UDP only cannot
+    // answer a TCP probe at all, so its health is probed with datagrams:
+    // one send, then any reply from the target within the window. The host
+    // route above still applies — an unmarked, device-bound socket needs a
+    // main-table route into the tunnel.
+    if link.gateway.is_none() && config.udp && config.target.is_ipv4() {
+        if let Some(source) = source_address(&link.interface, 4) {
+            return udp_probe(&link.interface, source, config.target);
+        }
+        return ProbeOutcome::failed();
+    }
     if let Some(source) = source_address(&link.interface, 4) {
         return tcp_probe(&link.interface, source, config.target);
     }
@@ -297,6 +340,48 @@ fn tcp_probe(interface: &str, source: IpAddr, target: SocketAddr) -> ProbeOutcom
     match socket.connect_timeout(&target.into(), PROBE_TIMEOUT) {
         Ok(()) => ProbeOutcome::success(started.elapsed()),
         Err(_) => ProbeOutcome::failed(),
+    }
+}
+
+/// One UDP datagram to the target, then any reply from it wins. The probe
+/// says nothing about which service replied — a link probe's contract is
+/// "the tunnel carried a datagram out and a datagram back", so the payload
+/// is opaque and the source address is the only check.
+fn udp_probe(interface: &str, source: IpAddr, target: SocketAddr) -> ProbeOutcome {
+    let Ok(socket) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) else {
+        return ProbeOutcome::failed();
+    };
+    let local = SocketAddr::new(source, 0);
+    if socket.bind(&local.into()).is_err()
+        || socket.bind_device(Some(interface.as_bytes())).is_err()
+        || socket.set_mark(0).is_err()
+    {
+        return ProbeOutcome::failed();
+    }
+    let payload = [0x6e, 0x73, 0x63, 0x6f, 0x70, 0x65]; // "nscope"
+    if socket.send_to(&payload, &target.into()).is_err() {
+        return ProbeOutcome::failed();
+    }
+    let started = Instant::now();
+    let deadline = started + PROBE_TIMEOUT;
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 512];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ProbeOutcome::failed();
+        }
+        if socket.set_read_timeout(Some(remaining)).is_err() {
+            return ProbeOutcome::failed();
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((_, addr)) if addr.as_socket() == Some(target) => {
+                return ProbeOutcome::success(started.elapsed());
+            }
+            Ok(_) => continue,
+            // A timeout under `remaining` keeps the loop honest; other
+            // socket errors end the probe.
+            Err(_) => return ProbeOutcome::failed(),
+        }
     }
 }
 

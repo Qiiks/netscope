@@ -1118,12 +1118,12 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
     }
     let already_attached = rt.cgroup.procs(id).is_ok_and(|pids| pids.contains(&pid));
     if already_attached {
-        if matches!(
-            inner.provenance.get(&pid),
-            Some(AttachSource::PreExec | AttachSource::PreOpen)
-        ) {
-            return;
-        }
+        // A pre-exec/pre-open attach happens before the game holds sockets:
+        // under Wine those sockets are created later by the shared
+        // wineserver, which never joins the cgroup, so the cgroup match can
+        // never cover them. Fall through and mark here — `mark_sockets` is
+        // gated on the policy, keeps pinned sockets direct, and stays
+        // retryable until it actually marks something.
         inner.provenance.entry(pid).or_insert(source);
         if !inner.marked.get(id).is_some_and(|pids| pids.contains(&pid))
             && mark_sockets(&profile, pid)
@@ -1546,6 +1546,8 @@ async fn link_task(rt: Arc<Rt>) {
             .parse()
             .expect("probe_target is validated when the config loads"),
         target6: rt.cfg.daemon.probe_target6.parse().ok(),
+        // udp is per profile: the route policy decides the transport.
+        udp: false,
     };
     let mut ticker = interval(Duration::from_millis(config.interval_ms));
     loop {
@@ -1576,6 +1578,7 @@ async fn link_task(rt: Arc<Rt>) {
                                 }
                             ))
                         ),
+                        profile.route_is_udp_only(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1589,13 +1592,16 @@ async fn link_task(rt: Arc<Rt>) {
             // stretching the round past the probe interval.
             std::thread::scope(|scope| {
                 jobs.into_iter()
-                    .map(|(id, links, allow_ipv6)| {
+                    .map(|(id, links, allow_ipv6, udp_only)| {
                         let handles = links
                             .iter()
                             .map(|link| {
                                 let mut config = probe_config.clone();
                                 if !allow_ipv6 {
                                     config.target6 = None;
+                                }
+                                if udp_only {
+                                    config.udp = true;
                                 }
                                 let link = link.clone();
                                 scope.spawn(move || links::probe(&link, &config))
@@ -1926,12 +1932,17 @@ fn attach_event(
             .get(&profile.id)
             .is_some_and(|pids| pids.contains(&pid))
         {
-            mark_sockets(profile, pid);
-            inner
-                .marked
-                .entry(profile.id.clone())
-                .or_default()
-                .insert(pid);
+            // `mark_sockets` stays retryable when it marked nothing (no
+            // sockets yet, or every socket pinned): only a pass that marked
+            // sockets may close the pid out, or a socket created after this
+            // attach would never be marked at all.
+            if mark_sockets(profile, pid) {
+                inner
+                    .marked
+                    .entry(profile.id.clone())
+                    .or_default()
+                    .insert(pid);
+            }
         }
         return true;
     }
