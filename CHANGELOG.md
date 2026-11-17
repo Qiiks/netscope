@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1 — 2026-11-18
+
+### Fixed
+
+- A Wine/Proton game attached before its PE opens now retries socket marking
+  after every poll instead of recording the process as marked once. Wine
+  creates the game's sockets in the shared `wineserver`, so those sockets
+  appear after the attach and the earlier one-shot pass left them unmarked and
+  outside the route.
+- The attach path no longer records a pid as marked when nothing was marked
+  yet. A process attached at exec had its mark pass run before it created its
+  first socket, and the empty result closed the retry; the next poll now picks
+  that socket up.
+- A UDP-only route link is probed with UDP datagrams, including on a gated
+  link, and a gateway-less probe target gets a device-scoped host route. A
+  UDP-only tunnel previously failed every TCP probe and read as permanently
+  down.
+
 ## 0.3.0 — 2026-11-12
 
 ### Added

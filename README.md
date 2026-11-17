@@ -47,8 +47,10 @@ sudo netscope --uid "$(id -u)" add game --process Overwatch.exe --route tun0
 `--process` matches a process's `comm` or an argv basename, so `Overwatch`,
 `Overwatch.exe`, and `overwatch.exe` are the same target. A running process is
 attached on the next poll and its existing sockets are marked, so a restart is
-not required. A new Wine/Proton launch is caught before the loader runs, so the
-game's first socket is already scoped.
+not required. A new Wine/Proton launch is caught by the loader hold before its
+first socket, but because a Wine game's sockets are created by the shared
+`wineserver` — which never joins the cgroup — those sockets are marked with the
+profile mark by the next poll pass (default 1 s).
 
 `netscope status`, `netscope list`, `netscope doctor`, and `netscope support-bundle` cover inspection and troubleshooting. No wrapper is required: native ELF apps are caught at `exec`, Windows PEs launched through Wine/Proton are caught when Wine opens the PE, name targets hold the Wine loader, and Steam apps are matched by app id.
 

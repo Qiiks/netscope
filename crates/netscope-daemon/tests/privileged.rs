@@ -1166,7 +1166,9 @@ fn shared_scope_composes_filter_and_route_for_two_consumers() {
     assert_eq!(released.consumers, vec!["exitlink".to_string()]);
     let body = run_cmd("nft", &["list", "table", "inet", table.as_str()]);
     assert!(
-        !body.contains("counter drop"),
+        !body
+            .lines()
+            .any(|line| line.trim_end().ends_with("counter drop")),
         "filter survived close: {body}"
     );
     assert!(
@@ -1280,7 +1282,12 @@ fn shared_scope_routes_fake_game_and_drops_after_policy_change() {
         },
     );
     daemon.track_profile(&id, &route);
+    let mark = parse_mark(&route.mark).expect("route mark");
     wait_for_cgroup(&daemon, &id, first.id(), Duration::from_secs(2));
+    // The fixture's socket predates the cgroup move, so only the mark pass
+    // can route it; sending before that pass would test the race, not the
+    // policy.
+    wait_for_marks(&daemon, first.id(), mark, 1);
 
     first
         .stdin
@@ -1322,6 +1329,7 @@ fn shared_scope_routes_fake_game_and_drops_after_policy_change() {
         .expect("read second ready");
     assert_eq!(ready.trim(), "ready", "second fake game did not open");
     wait_for_cgroup(&daemon, &id, second.id(), Duration::from_secs(2));
+    wait_for_marks(&daemon, second.id(), mark, 1);
     second
         .stdin
         .take()
@@ -1494,6 +1502,87 @@ fn late_socket_mark_routes_existing_socket() {
 
     client.remove(&id);
     let _ = fs::remove_file(&sender);
+}
+
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn wine_socket_created_later_is_marked() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    preflight();
+    let mut daemon = Daemon::new("wine-late");
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let (fixture, _) = build_fixture(&daemon.temp);
+
+    let loader = daemon.temp.join("wine64");
+    fs::copy(&fixture, &loader).expect("copy wine loader");
+    fs::set_permissions(&loader, fs::Permissions::from_mode(0o755)).expect("chmod wine loader");
+
+    let id = format!("wine-late-{pid}");
+    let added = client.add(
+        &id,
+        TargetSpec::Name {
+            name: "winegame".to_string(),
+        },
+        filter_drop(),
+        0,
+    );
+    daemon.track_profile(&id, &added);
+    let mark = parse_mark(&added.mark).expect("filter profile mark");
+
+    let mut child = Command::new(&loader)
+        .arg("two-sockets")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wine loader");
+    let child_pid = child.id();
+    daemon.track_pid(child_pid);
+    let mut output = BufReader::new(child.stdout.take().expect("loader stdout"));
+    let mut line = String::new();
+    output.read_line(&mut line).expect("read first socket line");
+    assert_eq!(line.trim(), "ready", "loader did not open its first socket");
+
+    wait_for_marks(&daemon, child_pid, mark, 1);
+    child
+        .stdin
+        .take()
+        .expect("loader stdin")
+        .write_all(b"x")
+        .expect("tell loader to open its second socket");
+    line.clear();
+    output
+        .read_line(&mut line)
+        .expect("read second socket line");
+    assert_eq!(
+        line.trim(),
+        "second",
+        "loader did not open its second socket"
+    );
+
+    wait_for_marks(&daemon, child_pid, mark, 2);
+    let _ = child.kill();
+    let _ = child.wait();
+    client.remove(&id);
+}
+
+fn wait_for_marks(daemon: &Daemon, pid: u32, mark: u32, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let marks = sockets::marks(pid).expect("read socket marks");
+        if marks.len() == expected && marks.iter().all(|(_, current)| *current == mark) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid {pid} did not reach {expected} sockets marked 0x{mark:x}: {marks:?}\n{}",
+            daemon.log_tail()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

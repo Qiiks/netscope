@@ -15,6 +15,7 @@ fn main() {
         Some("send") => send(args.get(2).expect("destination"), false),
         Some("send-open") => send(args.get(2).expect("destination"), true),
         Some("recv") => recv(args.get(2).expect("port")),
+        Some("two-sockets") => two_sockets(),
         Some("open-sleep") => open_sleep(args.get(2).expect("pe path")),
         _ => std::process::exit(2),
     }
@@ -49,6 +50,22 @@ fn send(dst: &str, open_first: bool) {
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
         Err(err) => panic!("send probe: {err:?}"),
     }
+}
+
+fn two_sockets() {
+    // Keep the copied loader as /proc/self/exe while matching a game name.
+    std::fs::write("/proc/self/comm", "winegame").expect("set process name");
+    let _first = UdpSocket::bind("0.0.0.0:0").expect("bind first socket");
+    println!("ready");
+    std::io::stdout().flush().expect("flush ready");
+    let mut gate = [0u8; 1];
+    std::io::stdin()
+        .read_exact(&mut gate)
+        .expect("wait for second socket");
+    let _second = UdpSocket::bind("0.0.0.0:0").expect("bind second socket");
+    println!("second");
+    std::io::stdout().flush().expect("flush second");
+    std::thread::sleep(Duration::from_secs(30));
 }
 
 fn recv(port: &str) {

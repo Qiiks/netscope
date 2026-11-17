@@ -1125,9 +1125,11 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
         // gated on the policy, keeps pinned sockets direct, and stays
         // retryable until it actually marks something.
         inner.provenance.entry(pid).or_insert(source);
-        if !inner.marked.get(id).is_some_and(|pids| pids.contains(&pid))
-            && mark_sockets(&profile, pid)
-        {
+        // A Wine game keeps creating sockets in wineserver after the first
+        // successful pass, so its mark has to be reapplied every poll. A
+        // native process stays covered by the cgroup after one pass.
+        let marked = inner.marked.get(id).is_some_and(|pids| pids.contains(&pid));
+        if (!marked || proc::is_wine_process(pid)) && mark_sockets(&profile, pid) {
             inner.marked.entry(id.to_string()).or_default().insert(pid);
         }
         return;
@@ -1139,8 +1141,8 @@ fn attach_one(rt: &Rt, inner: &mut Inner, id: &str, pid: u32, source: AttachSour
                     .marked
                     .get(id)
                     .is_some_and(|pids| pids.contains(&tgid))
+                    && mark_sockets(&profile, tgid)
                 {
-                    mark_sockets(&profile, tgid);
                     inner.marked.entry(id.to_string()).or_default().insert(tgid);
                 }
                 inner.provenance.insert(tgid, source);

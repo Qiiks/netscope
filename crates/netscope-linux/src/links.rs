@@ -248,12 +248,11 @@ pub fn probe(link: &RouteLink, config: &ProbeConfig) -> ProbeOutcome {
             }
         }
     }
-    // A gateway-less link (tun/ptp) whose route carries UDP only cannot
-    // answer a TCP probe at all, so its health is probed with datagrams:
-    // one send, then any reply from the target within the window. The host
-    // route above still applies — an unmarked, device-bound socket needs a
-    // main-table route into the tunnel.
-    if link.gateway.is_none() && config.udp && config.target.is_ipv4() {
+    // A UDP-only route cannot answer a TCP probe at all, so its health is
+    // probed with datagrams: one send, then any reply from the target within
+    // the window. This applies to gated links too; only a gateway-less link
+    // needs the host route above.
+    if config.udp && config.target.is_ipv4() {
         if let Some(source) = source_address(&link.interface, 4) {
             return udp_probe(&link.interface, source, config.target);
         }
@@ -354,7 +353,6 @@ fn udp_probe(interface: &str, source: IpAddr, target: SocketAddr) -> ProbeOutcom
     let local = SocketAddr::new(source, 0);
     if socket.bind(&local.into()).is_err()
         || socket.bind_device(Some(interface.as_bytes())).is_err()
-        || socket.set_mark(0).is_err()
     {
         return ProbeOutcome::failed();
     }
@@ -432,6 +430,30 @@ mod tests {
 
     fn fail() -> ProbeOutcome {
         ProbeOutcome::failed()
+    }
+
+    #[test]
+    fn udp_probe_accepts_a_reply_from_the_target() {
+        use std::net::UdpSocket;
+        use std::thread;
+
+        let server = UdpSocket::bind("127.0.0.1:0").expect("bind UDP responder");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set responder timeout");
+        let target = server.local_addr().expect("responder address");
+        let responder = thread::spawn(move || {
+            let mut buf = [0_u8; 32];
+            let (len, peer) = server.recv_from(&mut buf).expect("receive probe");
+            server.send_to(&buf[..len], peer).expect("answer probe");
+        });
+
+        let outcome = udp_probe("lo", IpAddr::from([127, 0, 0, 1]), target);
+        responder.join().expect("join UDP responder");
+        assert!(
+            matches!(outcome, ProbeOutcome::Up { .. }),
+            "probe over a bound loopback device did not see the reply"
+        );
     }
 
     #[test]

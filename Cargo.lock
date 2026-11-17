@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "netscope-linux",
  "serde",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-daemon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "netscope-client",
  "rune",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "netscope-linux"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "ipnet",
