@@ -97,6 +97,13 @@ matches those sockets with `socket mark` in addition to `socket cgroupv2`.
 Name targets use this path for a process that was already running; a new Wine
 launch is caught by the loader hold instead.
 
+A Wine game's sockets are created by the shared `wineserver`, which never
+joins the profile cgroup, so `socket cgroupv2` cannot match them. A game
+attached by the loader hold therefore gets its sockets marked by the next
+poll pass (`poll_interval_ms`) once they exist, exactly like a late attach.
+A pass that marks nothing — no sockets yet, or every socket pinned — stays
+retryable until it marks something.
+
 This needs `CAP_NET_ADMIN` and the ability to inspect the target process, which
 the root daemon has. If a descriptor cannot be reached, the attach is reported
 with a `mark profile=... error=...` log line and that socket keeps its original
