@@ -2513,10 +2513,13 @@ async fn set_policy(
     }
     let old = profile.policies.insert(consumer.to_string(), policy);
     profile.touch();
-    // A filter-only profile marked every socket, TCP included. Clear those
-    // stream marks before the UDP-only rule appears, or the mark reroutes
-    // established TCP sessions into the tunnel.
-    if profile.route_is_udp_only() && !before.route_is_udp_only() {
+    // A filter-only profile marked every socket, TCP included; a UDP-only
+    // route must not keep those stream marks. Any route change also forgets
+    // them so `attach_matches` applies the new protocol scope: leaving
+    // udp_only for a full route has to mark TCP again.
+    if profile.route_is_udp_only() != before.route_is_udp_only()
+        || (profile.has_route() && !before.has_route())
+    {
         clear_stream_marks(rt, &mut inner, &profile);
     }
     if let Err(err) = apply_profile(rt, &inner, &profile) {

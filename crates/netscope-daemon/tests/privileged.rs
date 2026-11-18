@@ -1664,6 +1664,116 @@ fn udp_only_route_clears_filter_stream_marks() {
     client.remove(&id);
 }
 
+/// A UDP-only route leaves TCP unmarked; switching that same profile to a
+/// full route must mark the stream socket again (issue #7).
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn full_route_after_udp_only_marks_stream_sockets() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    preflight();
+    let mut daemon = Daemon::new_with_poll("udp-full", 100);
+    let mut client = daemon.client();
+    let pid = std::process::id();
+    let name = "netscope-tcp2";
+    let link = format!("nsdum{}", pid % 10000);
+    run_ip(&["link", "add", &link, "type", "dummy"]);
+    daemon.track_link(&link);
+    run_ip(&["link", "set", &link, "up"]);
+
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            "import ctypes, socket, time\n\
+             ctypes.CDLL(None, use_errno=True).prctl(15, b'netscope-tcp2', 0, 0, 0)\n\
+             t = socket.socket()\n\
+             t.bind(('127.0.0.1', 0)); t.listen()\n\
+             d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+             d.bind(('127.0.0.1', 0))\n\
+             print('ready', flush=True)\n\
+             time.sleep(60)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn TCP holder");
+    let child_pid = child.id();
+    daemon.track_pid(child_pid);
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("child stdout"))
+        .read_line(&mut ready)
+        .expect("read child ready");
+    assert_eq!(ready.trim(), "ready", "TCP holder did not open its socket");
+
+    let id = format!("udp-full-{pid}");
+    let added = client.add(
+        &id,
+        TargetSpec::Name {
+            name: name.to_string(),
+        },
+        PolicySpec::Route {
+            interface: link.clone(),
+            gateway: None,
+            gateway6: None,
+            links: Vec::new(),
+            include_lan: false,
+            allow_ipv6: false,
+            udp_only: true,
+            except_ports: Vec::new(),
+            except_sports: Vec::new(),
+            except: Vec::new(),
+        },
+        0,
+    );
+    daemon.track_profile(&id, &added);
+    wait_for_cgroup(&daemon, &id, child_pid, Duration::from_secs(2));
+    let mark = parse_mark(&added.mark).expect("route profile mark");
+    let marks = sockets::marks(child_pid).expect("read TCP holder marks");
+    assert!(
+        marks.len() == 2 && marks.iter().filter(|(_, current)| *current == mark).count() == 1,
+        "a UDP-only route must mark the datagram socket and leave the TCP socket unmarked: {marks:?}\n{}",
+        daemon.log_tail()
+    );
+
+    let full = client.set_policy(
+        &id,
+        "netscope-cli",
+        PolicySpec::Route {
+            interface: link,
+            gateway: None,
+            gateway6: None,
+            links: Vec::new(),
+            include_lan: false,
+            allow_ipv6: false,
+            udp_only: false,
+            except_ports: Vec::new(),
+            except_sports: Vec::new(),
+            except: Vec::new(),
+        },
+    );
+    daemon.track_profile(&id, &full);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let marks = sockets::marks(child_pid).expect("read TCP holder marks");
+        if marks.len() == 2 && marks.iter().all(|(_, current)| *current == mark) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP socket stayed unmarked after the full route: {marks:?}\n{}",
+            daemon.log_tail()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    client.remove(&id);
+}
+
 fn wait_for_marks(daemon: &Daemon, pid: u32, mark: u32, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
