@@ -1569,6 +1569,101 @@ fn wine_socket_created_later_is_marked() {
     client.remove(&id);
 }
 
+/// A filter-only profile marks TCP sockets; adding a UDP-only route to that
+/// same profile must clear the TCP mark so an established session is not
+/// rerouted into the datagram-only tunnel (issue #7).
+#[test]
+#[ignore = "requires root and CAP_NET_ADMIN"]
+fn udp_only_route_clears_filter_stream_marks() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    preflight();
+    let mut daemon = Daemon::new_with_poll("udp-stream", 100);
+    let mut client = daemon.client();
+    let pid = std::process::id();
+
+    // A profile target by process name needs a name no other process uses;
+    // PR_SET_NAME gives the python child that comm.
+    let name = "netscope-tcp";
+    let link = format!("nsdum{}", pid % 10000);
+    run_ip(&["link", "add", &link, "type", "dummy"]);
+    daemon.track_link(&link);
+    run_ip(&["link", "set", &link, "up"]);
+
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            "import ctypes, socket, time\n\
+             ctypes.CDLL(None, use_errno=True).prctl(15, b'netscope-tcp', 0, 0, 0)\n\
+             t = socket.socket()\n\
+             t.bind(('127.0.0.1', 0)); t.listen()\n\
+             print('ready', flush=True)\n\
+             time.sleep(60)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn TCP holder");
+    let child_pid = child.id();
+    daemon.track_pid(child_pid);
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("child stdout"))
+        .read_line(&mut ready)
+        .expect("read child ready");
+    assert_eq!(ready.trim(), "ready", "TCP holder did not open its socket");
+
+    let id = format!("udp-stream-{pid}");
+    let added = client.add(
+        &id,
+        TargetSpec::Name {
+            name: name.to_string(),
+        },
+        filter_drop(),
+        0,
+    );
+    daemon.track_profile(&id, &added);
+    let mark = parse_mark(&added.mark).expect("filter profile mark");
+    wait_for_marks(&daemon, child_pid, mark, 1);
+
+    let routed = client.set_policy(
+        &id,
+        "netscope-cli",
+        PolicySpec::Route {
+            interface: link,
+            gateway: None,
+            gateway6: None,
+            links: Vec::new(),
+            include_lan: false,
+            allow_ipv6: false,
+            udp_only: true,
+            except_ports: Vec::new(),
+            except_sports: Vec::new(),
+            except: Vec::new(),
+        },
+    );
+    daemon.track_profile(&id, &routed);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let marks = sockets::marks(child_pid).expect("read TCP holder marks");
+        if marks.len() == 1 && marks.iter().all(|(_, current)| *current == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP socket kept mark 0x{mark:x} after the UDP-only route: {marks:?}\n{}",
+            daemon.log_tail()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    client.remove(&id);
+}
+
 fn wait_for_marks(daemon: &Daemon, pid: u32, mark: u32, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {

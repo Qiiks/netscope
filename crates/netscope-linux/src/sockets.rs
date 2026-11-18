@@ -188,6 +188,51 @@ pub fn clear_mark(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
     Ok(cleared)
 }
 
+/// Clears `mark` from the STREAM (TCP) sockets held by `pid`, leaving other
+/// socket types untouched.
+///
+/// A filter-only profile marks every socket, TCP included, which is what the
+/// filter's `socket mark` match needs. When that profile later gains a
+/// UDP-only route, those stream marks would feed established TCP sessions into
+/// the datagram-only tunnel, so they must be cleared before the fwmark rule is
+/// installed.
+///
+/// # Errors
+///
+/// Returns [`SocketMarkError`] under the same conditions as [`set_mark`].
+pub fn clear_mark_stream(pid: u32, mark: u32) -> Result<usize, SocketMarkError> {
+    let pidfd = open_pidfd(pid)?;
+    let mut cleared = 0;
+    for fd in process_fds(pid)? {
+        let Some(socket) = duplicate_socket(pidfd.as_raw_fd(), pid, fd)? else {
+            continue;
+        };
+        if socket_type(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
+            fd,
+            pid,
+            source,
+        })? != Some(libc::SOCK_STREAM)
+        {
+            continue;
+        }
+        let current = socket_mark(socket.as_raw_fd()).map_err(|source| SocketMarkError::Mark {
+            fd,
+            pid,
+            source,
+        })?;
+        if current != Some(mark) {
+            continue;
+        }
+        set_socket_mark(socket.as_raw_fd(), 0).map_err(|source| SocketMarkError::Mark {
+            fd,
+            pid,
+            source,
+        })?;
+        cleared += 1;
+    }
+    Ok(cleared)
+}
+
 /// Clears `mark` from every process on the system that still carries it.
 ///
 /// Profile ids are reusable, so a mark caught by a process that escaped the
@@ -531,6 +576,75 @@ mod tests {
             set_mark(pid, MARK).expect("mark every socket"),
             2,
             "a route that is not UDP-only marks both sockets"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A filter-only profile marks every socket; a later UDP-only route must
+    /// clear the stream marks so established TCP flows stay on the host path
+    /// while the datagram mark still feeds the tunnel.
+    ///
+    /// `sudo cargo test -p netscope-linux --lib -- --ignored clear_stream_marks_only_tcp`
+    #[test]
+    #[ignore = "requires root: CAP_NET_ADMIN for SO_MARK, pidfd_getfd for the child's fds"]
+    fn clear_stream_marks_only_tcp() {
+        use std::io::{BufRead, BufReader};
+
+        let euid = {
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            unsafe { libc::geteuid() }
+        };
+        assert_eq!(
+            euid, 0,
+            "socket marking needs CAP_NET_ADMIN; run this test as root"
+        );
+
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import socket, time\n\
+                 t = socket.socket()\n\
+                 t.bind(('127.0.0.1', 0)); t.listen()\n\
+                 d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+                 d.bind(('127.0.0.1', 0))\n\
+                 print('ready', flush=True)\n\
+                 time.sleep(60)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn socket holder");
+        let pid = child.id();
+        let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).expect("child ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marks(pid).is_ok_and(|found| found.len() >= 2) {
+            assert!(
+                Instant::now() < deadline,
+                "the holder never opened both sockets"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            set_mark(pid, MARK).expect("mark every socket"),
+            2,
+            "a filter-only profile marks both sockets"
+        );
+        assert_eq!(
+            clear_mark_stream(pid, MARK).expect("clear stream marks"),
+            1,
+            "exactly the TCP socket is cleared"
+        );
+        let found = marks(pid).expect("read marks");
+        assert_eq!(
+            found.iter().filter(|(_, mark)| *mark == MARK).count(),
+            1,
+            "the datagram socket keeps the mark: {found:?}"
         );
 
         let _ = child.kill();

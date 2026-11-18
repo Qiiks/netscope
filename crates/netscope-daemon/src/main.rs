@@ -1218,6 +1218,38 @@ fn clear_socket_marks(id: &str, mark: u32, pids: &[u32]) {
     }
 }
 
+/// Clears the profile mark from the TCP sockets of the profile's processes.
+///
+/// A filter-only profile marks every socket, which is what its `socket mark`
+/// match needs. Once the profile gains a UDP-only route, a stream mark would
+/// take an established TCP session into the datagram-only tunnel, so the
+/// stream marks must go before the fwmark rule exists.
+fn clear_stream_marks(rt: &Rt, inner: &mut Inner, profile: &Profile) {
+    let mut pids = rt.cgroup.procs(&profile.id).unwrap_or_default();
+    pids.extend(inner.marked.get(&profile.id).into_iter().flatten().copied());
+    pids.sort_unstable();
+    pids.dedup();
+    let mut cleared = 0;
+    for pid in pids {
+        match sockets::clear_mark_stream(pid, profile.mark) {
+            Ok(count) => cleared += count,
+            Err(SocketMarkError::ProcessGone(_)) => {}
+            Err(err) => warn!(
+                "clear stream marks profile={} pid={pid} error={err}",
+                profile.id
+            ),
+        }
+    }
+    // The recorded marks no longer describe the sockets. Forgetting them lets
+    // `attach_matches` re-mark when the profile reverts to filter-only, and
+    // retries a failed transition.
+    inner.marked.remove(&profile.id);
+    info!(
+        "cleared stream marks profile={} sockets={cleared}",
+        profile.id
+    );
+}
+
 fn restat_targets(rt: &Rt, inner: &mut Inner) -> usize {
     let ids: Vec<ProfileId> = inner.state.profiles.keys().cloned().collect();
     let mut changed = 0usize;
@@ -2481,6 +2513,12 @@ async fn set_policy(
     }
     let old = profile.policies.insert(consumer.to_string(), policy);
     profile.touch();
+    // A filter-only profile marked every socket, TCP included. Clear those
+    // stream marks before the UDP-only rule appears, or the mark reroutes
+    // established TCP sessions into the tunnel.
+    if profile.route_is_udp_only() && !before.route_is_udp_only() {
+        clear_stream_marks(rt, &mut inner, &profile);
+    }
     if let Err(err) = apply_profile(rt, &inner, &profile) {
         match old {
             Some(old) => {
@@ -2533,6 +2571,11 @@ async fn clear_policy(
     inner.state.profiles.insert(id.to_string(), profile.clone());
     save_state(&rt.cfg.daemon.state_path, &inner.state)
         .map_err(|err| format!("state: write failed: {err}"))?;
+    // Dropping a UDP-only route leaves a filter-only profile whose TCP sockets
+    // are still unmarked from the transition; forget the recorded marks so the
+    // attach below re-marks instead of skipping known pids.
+    inner.marked.remove(&profile.id);
+    attach_matches(rt, &mut inner);
     Ok(profile_status(rt, &inner, &profile))
 }
 
