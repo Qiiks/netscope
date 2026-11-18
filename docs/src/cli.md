@@ -40,7 +40,7 @@ netscope status [--json]
 Prints the daemon version, pid, kernel, cgroup root, and one row per profile. The text form has a daemon header and the same columns as `list`:
 
 ```text
-DAEMON  netscoped 0.3.1  pid 1234  kernel 6.11.0-arch1-1
+DAEMON  netscoped 0.3.2  pid 1234  kernel 6.11.0-arch1-1
 CGROUP  /sys/fs/cgroup/netscope
 NAME       MODE    ENABLED  TARGET                      ATTACHED  CONSUMERS         POLICIES          TRAFFIC               PIDS
 blocked    filter  yes      /usr/bin/curl               pre-exec  cli               cli:filter        ↓ 0 B/s ↑ 2.1 kB/s   4242

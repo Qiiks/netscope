@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2 — 2026-11-18
+
+### Fixed
+
+- A UDP-only route landing on a profile that already carried a filter policy
+  no longer reroutes the profile's established TCP sessions into the tunnel.
+  The filter-only state marks every socket for the filter's `socket mark`
+  match; the route transition now clears those stream marks before the fwmark
+  rule is installed, so an auth session armed mid-game keeps its host path.
+
 ## 0.3.1 — 2026-11-18
 
 ### Fixed
