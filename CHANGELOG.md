@@ -9,6 +9,9 @@
   The filter-only state marks every socket for the filter's `socket mark`
   match; the route transition now clears those stream marks before the fwmark
   rule is installed, so an auth session armed mid-game keeps its host path.
+- The reverse transition is covered too: a profile that leaves `udp_only` for
+  a full route re-marks its TCP sockets instead of skipping pids whose
+  recorded marks described the old protocol scope.
 
 ## 0.3.1 — 2026-11-18
 
