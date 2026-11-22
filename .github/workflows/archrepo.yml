@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install packaging tools
-        run: pacman -Sy --noconfirm zstd pacman-contrib curl
+        # A rolling image goes stale fast; -Sy alone would be a partial upgrade.
+        run: pacman -Syu --noconfirm --needed zstd pacman-contrib curl
 
       - name: Create unprivileged build user
         run: useradd -m builder
