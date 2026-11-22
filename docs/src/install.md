@@ -29,7 +29,7 @@ stat -fc %T /sys/fs/cgroup
 | AUR `netscope-bin` | Binaries | Yes, via the package | Arch Linux and CachyOS |
 | Release tarball | Binaries, unit, sysusers, config, install scripts | Yes, via `install.sh` | Any supported distro |
 | Source build | Binaries from `target/release` | Yes, via `install.sh` | Development and ARM builds |
-| `cargo install --git` | Binaries only | No | Advanced users who already have the system files |
+| `cargo install` (crates.io or `--git`) | Binaries only | No | Advanced users who already have the system files |
 
 The unit, the `netscope` group definition, and `/etc/netscope/config.toml` are **not** installed by Cargo. The systemd unit executes `/usr/bin/netscoped`, so a Cargo-only install does not start as a service without extra work.
 
@@ -89,8 +89,11 @@ sudo usermod -aG netscope "$USER"
 ## Cargo
 
 ```sh
-cargo install --git https://github.com/Qiiks/netscope --tag v0.3.2 --locked netscope-cli netscope-daemon
+cargo install netscope-cli netscope-daemon
 ```
+
+Both crates are published on crates.io. To pin a tag instead, use
+`cargo install --git https://github.com/Qiiks/netscope --tag v0.3.2 --locked netscope-cli netscope-daemon`.
 
 This installs the two binaries into `~/.cargo/bin` and nothing else. To run the service, the unit expects them at `/usr/bin`:
 

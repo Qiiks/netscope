@@ -14,7 +14,7 @@ sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```
 
-Tarball and `cargo install --git` channels are documented in [docs/install.md](docs/install.md). Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or AUR. Full documentation: <https://qiiks.github.io/netscope/>.
+Tarball, crates.io, and `cargo install --git` channels are documented in [the install guide](docs/src/install.md). The published crates are `netscope-cli` (the `netscope` binary), `netscope-daemon` (the `netscoped` binary), `netscope-client`, and `netscope-linux`. Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or AUR. Full documentation: <https://qiiks.github.io/netscope/>.
 
 ## Use
 
@@ -110,7 +110,7 @@ A name target also holds the Wine/Proton loader binaries and matches the launche
 
 ## Security
 
-`netscoped` runs as root and accepts control messages only over a root-owned Unix socket in the `netscope` group. It loads no kernel module and opens no network listener. See [SECURITY.md](SECURITY.md) and [docs/security.md](docs/security.md).
+`netscoped` runs as root and accepts control messages only over a root-owned Unix socket in the `netscope` group. It loads no kernel module and opens no network listener. See [SECURITY.md](SECURITY.md) and [the security model](docs/src/security.md).
 
 ## Support
 
