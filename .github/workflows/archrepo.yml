@@ -31,7 +31,9 @@ jobs:
         run: pacman -Syu --noconfirm --needed zstd pacman-contrib curl
 
       - name: Create unprivileged build user
-        run: useradd -m builder
+        run: |
+          useradd -m builder
+          printf 'PACKAGER="netscope <https://github.com/Qiiks/netscope>"\n' >> /etc/makepkg.conf
 
       - name: Resolve version
         id: version
