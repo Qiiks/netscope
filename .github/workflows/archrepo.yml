@@ -1,0 +1,133 @@
+name: Arch package repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "netscope version to build (e.g. 0.3.2)"
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The publish job creates the rolling `archrepo` release, which fires
+    # `release: published` again. Only version tags may start a build.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: pacman -Sy --noconfirm zstd pacman-contrib curl
+
+      - name: Create unprivileged build user
+        run: useradd -m builder
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            version="${{ github.ref_name }}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          version="${version#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::resolved version '$version' is not a release version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stage recipe
+        run: |
+          mkdir -p /tmp/build
+          cp packaging/arch/PKGBUILD packaging/arch/netscope.install /tmp/build/
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" /tmp/build/PKGBUILD
+          chown -R builder:builder /tmp/build
+
+      - name: Build package
+        run: |
+          su builder -c 'cd /tmp/build && updpkgsums && makepkg -f --nodeps --nocheck'
+
+      - name: Create pacman database
+        run: |
+          cd /tmp/build
+          repo-add netscope.db.tar.gz ./*.pkg.tar.zst
+          cp --remove-destination netscope.db.tar.gz netscope.db
+          cp --remove-destination netscope.files.tar.gz netscope.files
+
+      - name: Stage repository files
+        run: |
+          mkdir -p dist
+          cp /tmp/build/*.pkg.tar.zst /tmp/build/netscope.db /tmp/build/netscope.files dist/
+
+      - name: Upload repository artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archrepo
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-24.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Download repository artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: archrepo
+          path: dist
+
+      - name: Publish rolling archrepo release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          notes="$(mktemp)"
+          cat > "$notes" <<'EOF'
+          Pacman repository for netscope.
+
+          Add it to `/etc/pacman.conf`:
+
+          ```
+          [netscope]
+          SigLevel = Optional TrustAll
+          Server = https://github.com/Qiiks/netscope/releases/download/archrepo
+          ```
+
+          Then install with `sudo pacman -Sy netscope`.
+
+          Packages are unsigned and built from the release tarball of the
+          version named in the package file name. This tag is rewritten on
+          every release; it is not a source tag.
+          EOF
+
+          if ! gh release view archrepo -R "$repo" >/dev/null 2>&1; then
+            gh release create archrepo -R "$repo" \
+              --title "Arch Linux package repository" \
+              --notes-file "$notes"
+          fi
+
+          # Drop packages from older versions so the repository only ever
+          # advertises the current release.
+          while read -r asset; do
+            [ -n "$asset" ] || continue
+            case "$asset" in
+              netscope-*.pkg.tar.zst) gh release delete-asset archrepo "$asset" -R "$repo" --yes ;;
+            esac
+          done < <(gh release view archrepo -R "$repo" --json assets --jq '.assets[].name')
+
+          gh release upload archrepo -R "$repo" \
+            dist/netscope-*.pkg.tar.zst dist/netscope.db dist/netscope.files --clobber

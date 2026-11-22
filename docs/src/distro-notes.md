@@ -1,6 +1,6 @@
 # Distro notes
 
-netscope needs a modern kernel, unified cgroup v2, nftables, iproute2, and systemd. These notes describe what usually works. The project's CI runs on Ubuntu 24.04; the AUR package and the release tarball are the only packaged channels in v0.3.2, and the release binary is x86_64.
+netscope needs a modern kernel, unified cgroup v2, nftables, iproute2, and systemd. These notes describe what usually works. The project's CI runs on Ubuntu 24.04. In v0.3.2 the packaged channels are the pacman repository, the release tarball, and the crates.io binaries; the tarball and the pacman package are x86_64.
 
 ## Kernel configuration
 
@@ -19,10 +19,16 @@ If `NFT_SOCKET` is missing, filter and route rules cannot match the profile cgro
 
 ## Arch Linux and CachyOS
 
-Use the AUR package:
+Use the pacman repository (x86_64):
+
+```ini
+[netscope]
+SigLevel = Optional TrustAll
+Server = https://github.com/Qiiks/netscope/releases/download/archrepo
+```
 
 ```sh
-yay -S netscope-bin
+sudo pacman -Sy netscope
 sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```

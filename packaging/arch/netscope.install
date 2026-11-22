@@ -1,4 +1,6 @@
 post_install() {
+  update-desktop-database -q /usr/share/applications 2>/dev/null || true
+  gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
   if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
     echo "add $SUDO_USER to the netscope group: sudo usermod -aG netscope $SUDO_USER"
   else
@@ -7,6 +9,8 @@ post_install() {
 }
 
 post_upgrade() {
+  update-desktop-database -q /usr/share/applications 2>/dev/null || true
+  gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
   systemctl try-restart netscoped.service 2>/dev/null || true
 }
 

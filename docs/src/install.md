@@ -26,24 +26,32 @@ stat -fc %T /sys/fs/cgroup
 
 | Channel | Installs | Unit and config | Best for |
 |---|---|---|---|
-| AUR `netscope-bin` | Binaries | Yes, via the package | Arch Linux and CachyOS |
+| pacman repository `netscope` | Binaries, unit, sysusers, config | Yes, via the package | Arch Linux and CachyOS (x86_64) |
 | Release tarball | Binaries, unit, sysusers, config, install scripts | Yes, via `install.sh` | Any supported distro |
 | Source build | Binaries from `target/release` | Yes, via `install.sh` | Development and ARM builds |
 | `cargo install` (crates.io or `--git`) | Binaries only | No | Advanced users who already have the system files |
 
-The unit, the `netscope` group definition, and `/etc/netscope/config.toml` are **not** installed by Cargo. The systemd unit executes `/usr/bin/netscoped`, so a Cargo-only install does not start as a service without extra work.
+The release tarball and the pacman package are both x86_64 only. The unit, the `netscope` group definition, and `/etc/netscope/config.toml` are **not** installed by Cargo. The systemd unit executes `/usr/bin/netscoped`, so a Cargo-only install does not start as a service without extra work.
 
-## AUR (Arch Linux, CachyOS)
+## Arch Linux (pacman repository)
 
-After the package is published:
+The `netscope` package is published on this project's GitHub releases, not the AUR; AUR is unavailable because new account registrations are closed. Add the repository to `/etc/pacman.conf`:
+
+```ini
+[netscope]
+SigLevel = Optional TrustAll
+Server = https://github.com/Qiiks/netscope/releases/download/archrepo
+```
+
+The packages are not signed, so `SigLevel = Optional TrustAll` is required. Then install:
 
 ```sh
-yay -S netscope-bin
+sudo pacman -Sy netscope
 sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```
 
-Log out and back in so the group membership applies. `paru -S netscope-bin` is equivalent.
+Log out and back in so the group membership applies. You can also build the recipe from [`packaging/arch`](https://github.com/Qiiks/netscope/tree/main/packaging/arch) with `makepkg -si`.
 
 ## Release tarball
 
@@ -117,7 +125,7 @@ Run a first profile from [Quick start](quickstart.md).
 
 ## Upgrade
 
-- **AUR:** `yay -Syu netscope-bin` (or `paru -Syu netscope-bin`), then `sudo systemctl restart netscoped`.
+- **pacman repository:** `sudo pacman -Syu`, then `sudo systemctl restart netscoped`.
 - **Tarball or source:** unpack or rebuild, then `sudo ./install.sh` again. The installer stops the old daemon, replaces the binaries and unit, preserves `/etc/netscope/config.toml` and `/var/lib/netscope/state.json`, and restarts the service.
 - **Cargo:** rerun the `cargo install` command and copy the binaries to `/usr/bin`, then `sudo systemctl restart netscoped`.
 
@@ -125,7 +133,7 @@ Profiles live in `/var/lib/netscope/state.json` and survive upgrades. The state 
 
 ## Uninstall
 
-- **AUR:** `yay -Rns netscope-bin` (or `paru -Rns netscope-bin`).
+- **pacman repository:** `sudo pacman -Rns netscope`.
 - **Tarball or source:** `sudo ./uninstall.sh` from the extracted release or repository.
 
 `uninstall.sh` stops and disables the service, runs `netscope cleanup --all`, removes the binaries, unit, and sysusers entry, and removes the `netscope` group. It preserves `/etc/netscope` and `/var/lib/netscope` unless you pass `--purge`:
@@ -136,6 +144,6 @@ sudo ./uninstall.sh --purge
 
 Preview with `sudo ./uninstall.sh --dry-run`.
 
-Do not run `uninstall.sh` for an AUR install; it would delete files owned by the package manager. Remove the package instead, then optionally `sudo rm -rf /etc/netscope /var/lib/netscope` to clear state.
+Do not run `uninstall.sh` for a pacman install; it would delete files owned by the package manager. Remove the package instead, then optionally `sudo rm -rf /etc/netscope /var/lib/netscope` to clear state.
 
 If a process was still attached when the daemon exited, remove the leftover cgroup or reboot. `cleanup --all` removes netscope's profile cgroups when it can.

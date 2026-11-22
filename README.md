@@ -6,15 +6,23 @@ Per-application network scoping for Linux: select an app once, launch it normall
 
 ## Install
 
-Arch Linux / CachyOS (after the AUR package is published):
+Arch Linux / CachyOS (x86_64). Add the repository to `/etc/pacman.conf`:
+
+```ini
+[netscope]
+SigLevel = Optional TrustAll
+Server = https://github.com/Qiiks/netscope/releases/download/archrepo
+```
+
+Then install:
 
 ```sh
-yay -S netscope-bin
+sudo pacman -Sy netscope
 sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```
 
-Tarball, crates.io, and `cargo install --git` channels are documented in [the install guide](docs/src/install.md). The published crates are `netscope-cli` (the `netscope` binary), `netscope-daemon` (the `netscoped` binary), `netscope-client`, and `netscope-linux`. Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or AUR. Full documentation: <https://qiiks.github.io/netscope/>.
+Tarball, crates.io, and `cargo install --git` channels are documented in [the install guide](docs/src/install.md). The published crates are `netscope-cli` (the `netscope` binary), `netscope-daemon` (the `netscoped` binary), `netscope-client`, and `netscope-linux`. Cargo installs binaries only; the systemd unit, sysusers file, and config come from the tarball or the pacman package. Full documentation: <https://qiiks.github.io/netscope/>.
 
 ## Use
 

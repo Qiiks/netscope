@@ -1,5 +1,5 @@
-pkgname=netscope-bin
-pkgver=0.2.1
+pkgname=netscope
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="Per-application network scoping for Linux"
 arch=('x86_64')
@@ -7,14 +7,17 @@ url="https://github.com/Qiiks/netscope"
 license=('MIT' 'Apache')
 depends=('nftables' 'iproute2' 'systemd')
 backup=('etc/netscope/config.toml')
-install=netscope-bin.install
+install=netscope.install
 source=("$url/releases/download/v$pkgver/netscope-v$pkgver-x86_64-linux.tar.zst")
-sha256sums=('db850795c872c2a29ac9c782d85a12e142e1a53705cb7a4c038bbce5e9640c3d')
+sha256sums=('6dd230c6659dcd0e480588b41c46d3e6851abb199f1ca62b56836ff03d036fc8')
 
 package() {
   cd "$srcdir/netscope-v$pkgver-x86_64-linux"
   install -Dm755 netscope "$pkgdir/usr/bin/netscope"
   install -Dm755 netscoped "$pkgdir/usr/bin/netscoped"
+  install -Dm755 netscope-gui "$pkgdir/usr/bin/netscope-gui"
+  install -Dm644 netscope-gui.desktop "$pkgdir/usr/share/applications/netscope-gui.desktop"
+  install -Dm644 netscope-gui.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/netscope-gui.png"
   install -Dm644 netscoped.service "$pkgdir/usr/lib/systemd/system/netscoped.service"
   install -Dm644 netscope.sysusers "$pkgdir/usr/lib/sysusers.d/netscope.conf"
   install -Dm644 config.toml "$pkgdir/etc/netscope/config.toml"
