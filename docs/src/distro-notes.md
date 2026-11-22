@@ -28,7 +28,7 @@ Server = https://github.com/Qiiks/netscope/releases/download/archrepo
 ```
 
 ```sh
-sudo pacman -Sy netscope
+sudo pacman -Syu netscope
 sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```

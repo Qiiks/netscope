@@ -46,7 +46,7 @@ Server = https://github.com/Qiiks/netscope/releases/download/archrepo
 The packages are not signed, so `SigLevel = Optional TrustAll` is required. Then install:
 
 ```sh
-sudo pacman -Sy netscope
+sudo pacman -Syu netscope
 sudo systemctl enable --now netscoped
 sudo usermod -aG netscope "$USER"
 ```
