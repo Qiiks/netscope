@@ -55,3 +55,54 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/*.tar.zst dist/SHA256SUMS --generate-notes
+
+  crates:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # netscope-gui is excluded: it builds against rune from git, which
+      # crates.io rejects. It has publish = false and ships as a binary only.
+      - name: Publish to crates.io
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish" >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          agent="netscope-release/$(basename "$GITHUB_REPOSITORY")"
+
+          published() {
+            curl -fsS "https://crates.io/api/v1/crates/$1/$version" \
+              -H "User-Agent: $agent" >/dev/null 2>&1
+          }
+
+          # Order is forced by path dependencies: linux -> client -> cli/daemon.
+          # cargo publish waits for the index entry, so the dependent resolves.
+          for crate in netscope-linux netscope-client netscope-cli netscope-daemon; do
+            if published "$crate"; then
+              echo "$crate $version already on crates.io; skipping"
+              continue
+            fi
+            attempt=1
+            until cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN"; do
+              if [ "$attempt" -ge 4 ]; then
+                echo "$crate publish failed after $attempt attempts" >&2
+                exit 1
+              fi
+              echo "$crate publish attempt $attempt failed; retrying" >&2
+              attempt=$((attempt + 1))
+              sleep 20
+            done
+          done

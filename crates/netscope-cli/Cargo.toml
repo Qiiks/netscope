@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Unprivileged netscope command line"
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "netscope"
@@ -14,8 +16,8 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-netscope-client = { version = "0.3.1", path = "../netscope-client" }
-netscope-linux = { version = "0.3.1", path = "../netscope-linux" }
+netscope-client = { version = "0.3.2", path = "../netscope-client" }
+netscope-linux = { version = "0.3.2", path = "../netscope-linux" }
 serde_json = "1"
 tar = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
